@@ -157,7 +157,7 @@ export default function Dashboard() {
                   ) : (
                     <>
                       <Download className="mr-2 h-4 w-4" />
-                      Process & Download 3D ZIP
+                      Process & Download
                     </>
                   )}
                 </Button>
