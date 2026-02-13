@@ -1,0 +1,25 @@
+# General
+.DS_Store
+.env
+.env.local
+.venv
+venv/
+__pycache__/
+*.pyc
+
+# Backend
+backend/venv/
+backend/.env
+backend/__pycache__/
+backend/*.pyc
+backend/output/
+backend/input_images/
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/out/
+frontend/build/
+frontend/dist/
+frontend/.DS_Store
