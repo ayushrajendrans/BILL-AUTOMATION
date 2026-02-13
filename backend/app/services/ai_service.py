@@ -72,5 +72,7 @@ def analyze_image_with_gemini(image_bytes):
         return json.loads(content)
 
     except Exception as e:
+        import traceback
         print(f"Error calling OpenAI: {e}")
+        traceback.print_exc()
         return None
