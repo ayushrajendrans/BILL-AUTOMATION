@@ -8,3 +8,4 @@ openpyxl
 pillow
 supabase
 python-jose[cryptography]
+httpx

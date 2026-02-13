@@ -85,6 +85,50 @@ async def process_bills(files: List[UploadFile] = File(...)):
 def read_root():
     return {"message": "ClubBill AI API is running."}
 
+@app.get("/test-network")
+async def test_network():
+    import httpx
+    import os
+    
+    url = "https://models.inference.ai.azure.com"
+    key_prefix = os.getenv("OPENAI_API_KEY", "")[:5] + "..." if os.getenv("OPENAI_API_KEY") else "None"
+    
+    results = {
+        "api_key_present": bool(os.getenv("OPENAI_API_KEY")),
+        "api_key_prefix": key_prefix,
+        "endpoints": {}
+    }
+    
+    # Test Azure
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            results["endpoints"]["azure"] = {
+                "status": resp.status_code,
+                "reachable": True
+            }
+    except Exception as e:
+        results["endpoints"]["azure"] = {
+            "reachable": False,
+            "error": str(e)
+        }
+        
+    # Test Google (Control)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("https://www.google.com")
+            results["endpoints"]["google"] = {
+                "status": resp.status_code,
+                "reachable": True
+            }
+    except Exception as e:
+        results["endpoints"]["google"] = {
+            "reachable": False,
+            "error": str(e)
+        }
+        
+    return results
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
