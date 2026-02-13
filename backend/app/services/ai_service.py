@@ -6,19 +6,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configure OpenAI (using GitHub Models endpoint)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(
-    api_key=OPENAI_API_KEY,
-    base_url="https://models.inference.ai.azure.com"
-)
+import httpx
 
-def analyze_image_with_gemini(image_bytes):
+# (Remove OpenAI client initialization)
+# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# client = OpenAI(...) 
+
+async def analyze_image_with_gemini(image_bytes):
     """
-    Sends image to OpenAI GPT-4o to extract Club Name and Date.
-    (Function name kept for compatibility, but uses OpenAI now).
+    Sends image to OpenAI GPT-4o on GitHub Models via direct HTTP request.
     """
     try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            print("Error: No API Key found")
+            return None
+
         # Convert bytes to base64
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
 
@@ -43,9 +46,16 @@ def analyze_image_with_gemini(image_bytes):
         }
         """
 
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
+        url = "https://models.inference.ai.azure.com/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+            # "api-key": api_key # Some Azure endpoints use this, but GitHub Models uses Bearer
+        }
+
+        payload = {
+            "model": "gpt-4o",
+            "messages": [
                 {
                     "role": "user",
                     "content": [
@@ -59,17 +69,26 @@ def analyze_image_with_gemini(image_bytes):
                     ],
                 }
             ],
-            max_tokens=300,
-        )
-        
-        # Clean response
-        content = response.choices[0].message.content.strip()
-        if content.startswith("```json"):
-            content = content[7:-3].strip()
-        elif content.startswith("```"):
-            content = content[3:-3].strip()
+            "max_tokens": 300,
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, json=payload, headers=headers)
             
-        return json.loads(content)
+            if response.status_code != 200:
+                print(f"Error calling OpenAI (HTTP {response.status_code}): {response.text}")
+                return None
+            
+            data = response.json()
+            content = data["choices"][0]["message"]["content"].strip()
+            
+            # Clean response
+            if content.startswith("```json"):
+                content = content[7:-3].strip()
+            elif content.startswith("```"):
+                content = content[3:-3].strip()
+                
+            return json.loads(content)
 
     except Exception as e:
         import traceback

@@ -39,7 +39,7 @@ async def process_bills(files: List[UploadFile] = File(...)):
         content = await file.read()
         
         # Call AI Service
-        extraction_result = analyze_image_with_gemini(content)
+        extraction_result = await analyze_image_with_gemini(content)
         
         if extraction_result:
             club_name = extraction_result.get("club_name", "UNKNOWN_CLUB").upper().strip()
