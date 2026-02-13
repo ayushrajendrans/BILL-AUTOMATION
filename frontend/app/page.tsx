@@ -43,7 +43,8 @@ export default function Dashboard() {
       })
 
       if (!response.ok) {
-        throw new Error("Failed to process files")
+        const errorText = await response.text()
+        throw new Error(`Server Error: ${response.status} ${errorText}`)
       }
 
       // Download the ZIP file
@@ -60,10 +61,10 @@ export default function Dashboard() {
       setStatus('success')
       setMessage("Files processed and downloaded!")
       setFiles([]) // Reset
-    } catch (error) {
+    } catch (error: any) {
       console.error(error)
       setStatus('error')
-      setMessage("An error occurred during processing.")
+      setMessage(error.message || "An error occurred during processing.")
     }
   }
 
