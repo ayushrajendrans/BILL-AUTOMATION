@@ -21,6 +21,8 @@ async def analyze_image_with_gemini(image_bytes):
         if not api_key:
             print("Error: No API Key found")
             return None
+        
+        api_key = api_key.strip()
 
         # Convert bytes to base64
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
