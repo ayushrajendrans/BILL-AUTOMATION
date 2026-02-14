@@ -12,8 +12,16 @@ export async function GET(request: Request) {
     const redirectTo = requestUrl.searchParams.get("redirect_to")?.toString();
 
     if (code) {
+        console.log("Auth Callback: Received code", code);
         const supabase = await createClient();
-        await supabase.auth.exchangeCodeForSession(code);
+        const { error } = await supabase.auth.exchangeCodeForSession(code);
+        if (error) {
+            console.error("Auth Callback: Code exchange failed", error);
+            return NextResponse.redirect(`${origin}/login?error=auth_code_error`);
+        }
+        console.log("Auth Callback: Session exchanged successfully");
+    } else {
+        console.log("Auth Callback: No code received");
     }
 
     if (redirectTo) {

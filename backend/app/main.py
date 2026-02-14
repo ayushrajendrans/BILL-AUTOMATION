@@ -1,5 +1,11 @@
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from dotenv import load_dotenv
+import os
+
+env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+load_dotenv(env_path)
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import io
@@ -8,6 +14,8 @@ from typing import List
 from app.services.ai_service import analyze_image_with_gemini
 from app.services.excel_service import create_excel_with_images
 from app.services.auth_service import verify_token # Uncomment when frontend sends token
+from app.services.email_service import send_login_notification
+from pydantic import BaseModel
 
 app = FastAPI(title="ClubBill AI Backend")
 
@@ -83,6 +91,19 @@ async def process_bills(
     }
     
     return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+    return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+
+class LoginNotificationRequest(BaseModel):
+    name: str
+    email: str
+
+@app.post("/notify-login")
+async def notify_login(request: LoginNotificationRequest):
+    """
+    Triggers an email notification when a user logs in.
+    """
+    success = send_login_notification(request.name, request.email)
+    return {"status": "success" if success else "failed", "message": "Notification process completed"}
 
 @app.get("/")
 def read_root():

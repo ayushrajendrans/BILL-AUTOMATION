@@ -1,10 +1,10 @@
 "use client"
 
-import { useState, useRef, useEffect } from "react"
+import { useState, useEffect } from "react"
 import { FileUpload } from "@/components/file-upload"
 import { Button } from "@/components/ui/button"
 import { Loader2, Download, CheckCircle, AlertCircle, Sparkles, LogOut } from "lucide-react"
-import { motion, useScroll, useTransform } from "framer-motion"
+import { motion } from "framer-motion"
 import { BackgroundBeams } from "@/components/ui/background-beams"
 import { TiltCard } from "@/components/ui/tilt-card"
 import { createClient } from "@/utils/supabase/client"
@@ -21,32 +21,78 @@ export default function Dashboard() {
   const supabase = createClient()
 
   useEffect(() => {
-    const checkUser = async () => {
-      const { data: { user } } = await supabase.auth.getUser()
-      if (!user) {
-        router.push('/login')
-      } else {
-        setUser(user)
-      }
-      setLoadingAuth(false)
+    console.log("Dashboard mounted, initiating auth check...");
+
+    // Check if env vars are loaded
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+    if (!supabaseUrl || !supabaseKey) {
+      console.error("CRITICAL: Supabase environment variables are missing!");
+      setMessage("Error: Supabase configuration missing. Check .env.local");
+      setStatus('error');
+      setLoadingAuth(false);
+      return;
     }
+
+    const checkUser = async () => {
+      try {
+        console.log("Calling supabase.auth.getSession()...");
+        const { data, error } = await supabase.auth.getSession();
+
+        if (error) {
+          console.error("Supabase auth error:", error);
+          throw error;
+        }
+
+        if (!data.session?.user) {
+          console.log("No active session, redirecting to /login...");
+          router.push('/login')
+        } else {
+          console.log("Session found:", data.session.user.email);
+          setUser(data.session.user)
+          notifyLogin(data.session.user)
+        }
+      } catch (e) {
+        console.error("Error in checkUser (caught):", e);
+        console.log("Redirecting to /login due to error...");
+        router.push('/login');
+      } finally {
+        setLoadingAuth(false)
+      }
+    }
+
+    const notifyLogin = async (user: any) => {
+      // Prevent duplicate notifications in the same session
+      if (sessionStorage.getItem("login_notified")) return;
+
+      try {
+        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+        await fetch(`${apiUrl}/notify-login`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            name: user.user_metadata?.full_name || "Unknown User",
+            email: user.email,
+          }),
+        });
+        sessionStorage.setItem("login_notified", "true");
+        console.log("Login notification sent.");
+      } catch (error) {
+        console.error("Failed to send login notification:", error);
+      }
+    }
+
     checkUser()
-  }, [router, supabase])
+  }, [])
 
   const handleSignOut = async () => {
     await supabase.auth.signOut()
+    sessionStorage.removeItem("login_notified")
     router.push('/login')
   }
-
-  const targetRef = useRef(null)
-  const { scrollYProgress } = useScroll({
-    target: targetRef,
-    offset: ["start start", "end start"],
-  })
-
-  const opacity = useTransform(scrollYProgress, [0, 0.5], [1, 0])
-  const scale = useTransform(scrollYProgress, [0, 0.5], [1, 0.8])
-  const y = useTransform(scrollYProgress, [0, 0.5], [0, -50])
 
   const handleUpload = async () => {
     if (files.length === 0) return
@@ -111,7 +157,7 @@ export default function Dashboard() {
   if (!user) return null
 
   return (
-    <div ref={targetRef} className="relative min-h-screen w-full overflow-hidden bg-neutral-950 text-white selection:bg-purple-500 selection:text-white">
+    <div className="relative min-h-screen w-full overflow-hidden bg-neutral-950 text-white selection:bg-purple-500 selection:text-white">
       <BackgroundBeams />
 
       <div className="absolute top-4 right-4 z-50">
@@ -128,7 +174,6 @@ export default function Dashboard() {
 
       <div className="relative z-10 flex min-h-screen flex-col items-center justify-center p-8">
         <motion.div
-          style={{ opacity, scale, y }}
           className="mb-12 text-center space-y-4"
         >
           <motion.div
@@ -140,6 +185,25 @@ export default function Dashboard() {
               ClubBill AI
             </h1>
           </motion.div>
+
+          {user && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ delay: 0.3, duration: 0.8 }}
+              className="flex flex-col items-center gap-2"
+            >
+              <div className="flex items-center gap-2 bg-white/10 px-4 py-2 rounded-full border border-white/5">
+                {user.user_metadata?.avatar_url && (
+                  <img src={user.user_metadata.avatar_url} alt="Profile" className="w-6 h-6 rounded-full" />
+                )}
+                <span className="text-sm font-medium text-white">
+                  Welcome, {user.user_metadata?.full_name || user.email}
+                </span>
+              </div>
+              <span className="text-xs text-neutral-500">{user.email}</span>
+            </motion.div>
+          )}
 
           <motion.p
             initial={{ opacity: 0 }}

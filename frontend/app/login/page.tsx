@@ -12,6 +12,8 @@ export default function LoginPage() {
     const [loading, setLoading] = useState(false)
     const [message, setMessage] = useState('')
 
+    console.log("LoginPage rendering...");
+
     const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
         e.preventDefault()
         setLoading(true)
