@@ -1,18 +1,42 @@
-
 "use client"
 
-import { useState, useRef } from "react"
+import { useState, useRef, useEffect } from "react"
 import { FileUpload } from "@/components/file-upload"
 import { Button } from "@/components/ui/button"
-import { Loader2, Download, CheckCircle, AlertCircle, Sparkles } from "lucide-react"
+import { Loader2, Download, CheckCircle, AlertCircle, Sparkles, LogOut } from "lucide-react"
 import { motion, useScroll, useTransform } from "framer-motion"
 import { BackgroundBeams } from "@/components/ui/background-beams"
 import { TiltCard } from "@/components/ui/tilt-card"
+import { createClient } from "@/utils/supabase/client"
+import { useRouter } from "next/navigation"
 
 export default function Dashboard() {
   const [files, setFiles] = useState<File[]>([])
   const [status, setStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle')
   const [message, setMessage] = useState("")
+  const [user, setUser] = useState<any>(null)
+  const [loadingAuth, setLoadingAuth] = useState(true)
+
+  const router = useRouter()
+  const supabase = createClient()
+
+  useEffect(() => {
+    const checkUser = async () => {
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) {
+        router.push('/login')
+      } else {
+        setUser(user)
+      }
+      setLoadingAuth(false)
+    }
+    checkUser()
+  }, [router, supabase])
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut()
+    router.push('/login')
+  }
 
   const targetRef = useRef(null)
   const { scrollYProgress } = useScroll({
@@ -37,8 +61,16 @@ export default function Dashboard() {
 
     try {
       const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+
+      // Get session for token
+      const { data: { session } } = await supabase.auth.getSession()
+      const token = session?.access_token
+
       const response = await fetch(`${apiUrl}/process-bills`, {
         method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`
+        },
         body: formData,
       })
 
@@ -68,9 +100,31 @@ export default function Dashboard() {
     }
   }
 
+  if (loadingAuth) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-neutral-950 text-white">
+        <Loader2 className="h-8 w-8 animate-spin text-purple-500" />
+      </div>
+    )
+  }
+
+  if (!user) return null
+
   return (
     <div ref={targetRef} className="relative min-h-screen w-full overflow-hidden bg-neutral-950 text-white selection:bg-purple-500 selection:text-white">
       <BackgroundBeams />
+
+      <div className="absolute top-4 right-4 z-50">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={handleSignOut}
+          className="text-neutral-400 hover:text-white hover:bg-white/10"
+        >
+          <LogOut className="mr-2 h-4 w-4" />
+          Sign Out
+        </Button>
+      </div>
 
       <div className="relative z-10 flex min-h-screen flex-col items-center justify-center p-8">
         <motion.div

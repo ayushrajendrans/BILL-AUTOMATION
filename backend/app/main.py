@@ -7,7 +7,7 @@ import zipfile
 from typing import List
 from app.services.ai_service import analyze_image_with_gemini
 from app.services.excel_service import create_excel_with_images
-# from app.services.auth_service import verify_token # Uncomment when frontend sends token
+from app.services.auth_service import verify_token # Uncomment when frontend sends token
 
 app = FastAPI(title="ClubBill AI Backend")
 
@@ -23,7 +23,10 @@ app.add_middleware(
 )
 
 @app.post("/process-bills")
-async def process_bills(files: List[UploadFile] = File(...)):
+async def process_bills(
+    files: List[UploadFile] = File(...),
+    token: str = Depends(verify_token)
+):
     """
     Accepts multiple image files.
     Extracts data, groups by club, generates Excel files, and zips them.
