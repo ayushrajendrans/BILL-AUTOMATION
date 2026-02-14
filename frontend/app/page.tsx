@@ -162,10 +162,10 @@ export default function Dashboard() {
 
       <div className="absolute top-4 right-4 z-50">
         <Button
-          variant="ghost"
+          variant="outline"
           size="sm"
           onClick={handleSignOut}
-          className="text-neutral-400 hover:text-white hover:bg-white/10"
+          className="bg-red-500/10 border-red-500/50 text-red-200 hover:bg-red-500/20 hover:text-red-100 transition-colors"
         >
           <LogOut className="mr-2 h-4 w-4" />
           Sign Out
