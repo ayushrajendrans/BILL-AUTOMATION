@@ -16,7 +16,13 @@ def send_login_notification(user_name: str, user_email: str):
     sender_password = os.getenv("SENDER_PASSWORD")
     receiver_email = os.getenv("RECEIVER_EMAIL")
     smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587")) # STARTTLS port
     import socket # Ensure socket is imported
+
+    if not sender_email or not sender_password or not receiver_email:
+        msg = "Email credentials not set (SENDER_EMAIL, SENDER_PASSWORD, or RECEIVER_EMAIL missing)."
+        logger.warning(msg)
+        return False, msg
 
     try:
         # Create message
