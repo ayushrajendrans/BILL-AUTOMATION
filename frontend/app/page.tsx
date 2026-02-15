@@ -20,6 +20,47 @@ export default function Dashboard() {
   const router = useRouter()
   const supabase = createClient()
 
+  const notifyLogin = async (user: any) => {
+    // Prevent duplicate notifications in the same session
+    // DEBUG: Commented out to force testing email on every refresh
+    // if (sessionStorage.getItem("login_notified")) return;
+
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL;
+      if (!apiUrl) {
+        const msg = "NEXT_PUBLIC_API_URL is missing! Check Vercel Env Vars.";
+        console.error(msg);
+        alert(msg);
+        return;
+      }
+      const response = await fetch(`${apiUrl}/notify-login`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: user.user_metadata?.full_name || "Unknown User",
+          email: user.email,
+        }),
+      });
+
+      const result = await response.json();
+
+      if (result.status === 'failed') {
+        console.error("Login notification failed:", result.message);
+        // PROD TODO: Remove this alert after debugging
+        alert(`Debug: Email Notification Failed\nReason: ${result.message}`);
+      } else {
+        sessionStorage.setItem("login_notified", "true");
+        console.log("Login notification sent successfully.");
+        alert("Debug: Email Notification Sent Successfully!");
+      }
+    } catch (error) {
+      console.error("Failed to send login notification:", error);
+      alert(`Debug: Email Notification Network Error\n${error}`);
+    }
+  }
+
   useEffect(() => {
     console.log("Dashboard mounted, initiating auth check...");
 
@@ -62,43 +103,7 @@ export default function Dashboard() {
       }
     }
 
-    const notifyLogin = async (user: any) => {
-      // Prevent duplicate notifications in the same session
-      // DEBUG: Commented out to force testing email on every refresh
-      // if (sessionStorage.getItem("login_notified")) return;
 
-      try {
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL;
-        if (!apiUrl) {
-          console.error("NEXT_PUBLIC_API_URL is missing, cannot send login notification");
-          return;
-        }
-        const response = await fetch(`${apiUrl}/notify-login`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            name: user.user_metadata?.full_name || "Unknown User",
-            email: user.email,
-          }),
-        });
-
-        const result = await response.json();
-
-        if (result.status === 'failed') {
-          console.error("Login notification failed:", result.message);
-          // PROD TODO: Remove this alert after debugging
-          alert(`Debug: Email Notification Failed\nReason: ${result.message}`);
-        } else {
-          sessionStorage.setItem("login_notified", "true");
-          console.log("Login notification sent successfully.");
-        }
-      } catch (error) {
-        console.error("Failed to send login notification:", error);
-        alert(`Debug: Email Notification Network Error\n${error}`);
-      }
-    }
 
     checkUser()
   }, [])
@@ -185,6 +190,28 @@ export default function Dashboard() {
         >
           <LogOut className="mr-2 h-4 w-4" />
           Sign Out
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            if (user) notifyLogin(user);
+            else alert("No user found to test email with.");
+          }}
+          className="ml-2 bg-blue-500/10 border-blue-500/50 text-blue-200 hover:bg-blue-500/20 hover:text-blue-100 transition-colors"
+        >
+          Test Email
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            if (user) notifyLogin(user);
+            else alert("No user found to test email with.");
+          }}
+          className="ml-2 bg-blue-500/10 border-blue-500/50 text-blue-200 hover:bg-blue-500/20 hover:text-blue-100 transition-colors"
+        >
+          Test Email
         </Button>
       </div>
 
