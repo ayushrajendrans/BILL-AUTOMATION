@@ -16,7 +16,7 @@ def send_login_notification(user_name: str, user_email: str):
     sender_password = os.getenv("SENDER_PASSWORD")
     receiver_email = os.getenv("RECEIVER_EMAIL")
     smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))
 
     if not sender_email or not sender_password or not receiver_email:
         msg = "Email credentials not set (SENDER_EMAIL, SENDER_PASSWORD, or RECEIVER_EMAIL missing)."
@@ -40,9 +40,9 @@ def send_login_notification(user_name: str, user_email: str):
         """
         msg_container.attach(MIMEText(body, "plain"))
 
-        # Connect to server
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()  # Secure the connection
+        # Use SMTP_SSL for port 465 (more reliable on Render/Cloud)
+        server = smtplib.SMTP_SSL(smtp_server, smtp_port)
+        # server.starttls() # Not needed for SMTP_SSL
         server.login(sender_email, sender_password)
         
         # Send email
