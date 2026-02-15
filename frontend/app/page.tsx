@@ -67,7 +67,11 @@ export default function Dashboard() {
       if (sessionStorage.getItem("login_notified")) return;
 
       try {
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+        const apiUrl = process.env.NEXT_PUBLIC_API_URL;
+        if (!apiUrl) {
+          console.error("NEXT_PUBLIC_API_URL is missing, cannot send login notification");
+          return;
+        }
         await fetch(`${apiUrl}/notify-login`, {
           method: "POST",
           headers: {
@@ -106,7 +110,8 @@ export default function Dashboard() {
     })
 
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL;
+      if (!apiUrl) throw new Error("NEXT_PUBLIC_API_URL is not set");
 
       // Get session for token
       const { data: { session } } = await supabase.auth.getSession()
