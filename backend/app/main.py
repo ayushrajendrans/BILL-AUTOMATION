@@ -101,8 +101,11 @@ async def notify_login(request: LoginNotificationRequest):
     """
     Triggers an email notification when a user logs in.
     """
-    success = send_login_notification(request.name, request.email)
-    return {"status": "success" if success else "failed", "message": "Notification process completed"}
+    success, message = send_login_notification(request.name, request.email)
+    return {
+        "status": "success" if success else "failed", 
+        "message": message
+    }
 
 @app.get("/")
 def read_root():

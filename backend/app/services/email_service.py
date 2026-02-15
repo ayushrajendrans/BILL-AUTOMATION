@@ -19,15 +19,16 @@ def send_login_notification(user_name: str, user_email: str):
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
 
     if not sender_email or not sender_password or not receiver_email:
-        logger.warning("Email credentials not set. Skipping notification.")
-        return False
+        msg = "Email credentials not set (SENDER_EMAIL, SENDER_PASSWORD, or RECEIVER_EMAIL missing)."
+        logger.warning(msg)
+        return False, msg
 
     try:
         # Create message
-        msg = MIMEMultipart()
-        msg["From"] = sender_email
-        msg["To"] = receiver_email
-        msg["Subject"] = f"New Login Alert: {user_name}"
+        msg_container = MIMEMultipart()
+        msg_container["From"] = sender_email
+        msg_container["To"] = receiver_email
+        msg_container["Subject"] = f"New Login Alert: {user_name}"
 
         body = f"""
         A new user has logged into ClubBill AI.
@@ -37,7 +38,7 @@ def send_login_notification(user_name: str, user_email: str):
         
         Time: {os.popen('date').read().strip()}
         """
-        msg.attach(MIMEText(body, "plain"))
+        msg_container.attach(MIMEText(body, "plain"))
 
         # Connect to server
         server = smtplib.SMTP(smtp_server, smtp_port)
@@ -45,12 +46,13 @@ def send_login_notification(user_name: str, user_email: str):
         server.login(sender_email, sender_password)
         
         # Send email
-        server.sendmail(sender_email, receiver_email, msg.as_string())
+        server.sendmail(sender_email, receiver_email, msg_container.as_string())
         server.quit()
         
         logger.info(f"Login notification sent for {user_email}")
-        return True
+        return True, "Email sent successfully"
 
     except Exception as e:
-        logger.error(f"Failed to send email notification: {e}")
-        return False
+        error_msg = f"Failed to send email: {str(e)}"
+        logger.error(error_msg)
+        return False, error_msg

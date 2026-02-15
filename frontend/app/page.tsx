@@ -64,7 +64,8 @@ export default function Dashboard() {
 
     const notifyLogin = async (user: any) => {
       // Prevent duplicate notifications in the same session
-      if (sessionStorage.getItem("login_notified")) return;
+      // DEBUG: Commented out to force testing email on every refresh
+      // if (sessionStorage.getItem("login_notified")) return;
 
       try {
         const apiUrl = process.env.NEXT_PUBLIC_API_URL;
@@ -72,7 +73,7 @@ export default function Dashboard() {
           console.error("NEXT_PUBLIC_API_URL is missing, cannot send login notification");
           return;
         }
-        await fetch(`${apiUrl}/notify-login`, {
+        const response = await fetch(`${apiUrl}/notify-login`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -82,10 +83,20 @@ export default function Dashboard() {
             email: user.email,
           }),
         });
-        sessionStorage.setItem("login_notified", "true");
-        console.log("Login notification sent.");
+
+        const result = await response.json();
+
+        if (result.status === 'failed') {
+          console.error("Login notification failed:", result.message);
+          // PROD TODO: Remove this alert after debugging
+          alert(`Debug: Email Notification Failed\nReason: ${result.message}`);
+        } else {
+          sessionStorage.setItem("login_notified", "true");
+          console.log("Login notification sent successfully.");
+        }
       } catch (error) {
         console.error("Failed to send login notification:", error);
+        alert(`Debug: Email Notification Network Error\n${error}`);
       }
     }
 
