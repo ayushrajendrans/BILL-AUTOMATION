@@ -20,7 +20,12 @@ from pydantic import BaseModel
 app = FastAPI(title="ClubBill AI Backend")
 
 # Configure CORS
-origins = ["*"] # Allow all for dev, restrict in prod
+origins = [
+    "http://localhost:3000",
+    "https://bill-automation.vercel.app",
+    "https://bill-automation-frontend.vercel.app",
+    "*" # Keep wildcard for now to avoid breaking other things, but specific is better
+]
 
 app.add_middleware(
     CORSMiddleware,
