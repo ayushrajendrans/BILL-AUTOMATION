@@ -16,7 +16,7 @@ def send_login_notification(user_name: str, user_email: str):
     sender_password = os.getenv("SENDER_PASSWORD")
     receiver_email = os.getenv("RECEIVER_EMAIL")
     smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "587")) # STARTTLS port
+    smtp_port = int(os.getenv("SMTP_PORT", "465")) # SSL port
     import socket # Ensure socket is imported
 
     if not sender_email or not sender_password or not receiver_email:
@@ -45,22 +45,12 @@ def send_login_notification(user_name: str, user_email: str):
         # Force IPv4 resolution
         addr_info = socket.getaddrinfo(smtp_server, smtp_port, family=socket.AF_INET, proto=socket.IPPROTO_TCP)
         smtp_ip = addr_info[0][4][0]
-        print(f"Resolved to {smtp_ip}. Connecting...")
+        print(f"Resolved to {smtp_ip}. Connecting to Port {smtp_port} (SSL)...")
 
-        # Connect using the IPv4 address
-        server = smtplib.SMTP(smtp_ip, smtp_port, timeout=15)
+        # Connect using SMTP_SSL for Port 465
+        server = smtplib.SMTP_SSL(smtp_ip, smtp_port, timeout=15)
         
-        print("Connected. Starting TLS...")
-        # Create context that doesn't check hostname (since we depend on IP)
-        # This is a workaround for the 'Network Unreachable' IPv6 issue on Render
-        import ssl
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        
-        server.starttls(context=context) 
-        
-        print("Logging in...")
+        print("Connected. Logging in...")
         server.login(sender_email, sender_password)
         
         print("Sending mail...")
