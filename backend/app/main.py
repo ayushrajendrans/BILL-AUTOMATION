@@ -91,7 +91,6 @@ async def process_bills(
     }
     
     return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
-    return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
 
 class LoginNotificationRequest(BaseModel):
     name: str
