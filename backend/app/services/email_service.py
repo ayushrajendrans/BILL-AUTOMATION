@@ -1,78 +1,70 @@
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import os
+import json
 import logging
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+RESEND_API_URL = "https://api.resend.com/emails"
+
 def send_login_notification(user_name: str, user_email: str):
     """
-    Sends an email notification when a user logs in.
+    Sends an email notification when a user logs in, using Resend HTTP API.
     """
-    sender_email = os.getenv("SENDER_EMAIL")
-    sender_password = os.getenv("SENDER_PASSWORD")
+    api_key = os.getenv("RESEND_API_KEY")
     receiver_email = os.getenv("RECEIVER_EMAIL")
-    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "587")) # STARTTLS port
-    import socket # Ensure socket is imported
 
-    if not sender_email or not sender_password or not receiver_email:
-        msg = "Email credentials not set (SENDER_EMAIL, SENDER_PASSWORD, or RECEIVER_EMAIL missing)."
+    if not api_key or not receiver_email:
+        msg = "Email config missing (RESEND_API_KEY or RECEIVER_EMAIL not set)."
         logger.warning(msg)
         return False, msg
 
     try:
-        # Create message
-        msg_container = MIMEMultipart()
-        msg_container["From"] = sender_email
-        msg_container["To"] = receiver_email
-        msg_container["Subject"] = f"New Login Alert: {user_name}"
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        body = f"""
-        A new user has logged into ClubBill AI.
+        payload = json.dumps({
+            "from": "ClubBill AI <onboarding@resend.dev>",
+            "to": [receiver_email],
+            "subject": f"New Login Alert: {user_name}",
+            "html": f"""
+                <h2>🔔 New Login Alert</h2>
+                <p>A user has logged into <b>ClubBill AI</b>.</p>
+                <table style="border-collapse:collapse;">
+                    <tr><td style="padding:4px 12px;"><b>Name</b></td><td>{user_name}</td></tr>
+                    <tr><td style="padding:4px 12px;"><b>Email</b></td><td>{user_email}</td></tr>
+                    <tr><td style="padding:4px 12px;"><b>Time</b></td><td>{now}</td></tr>
+                </table>
+            """
+        }).encode("utf-8")
 
-        Name: {user_name}
-        Email: {user_email}
-        
-        Time: {os.popen('date').read().strip()}
-        """
-        msg_container.attach(MIMEText(body, "plain"))
+        req = Request(RESEND_API_URL, data=payload, method="POST")
+        req.add_header("Authorization", f"Bearer {api_key}")
+        req.add_header("Content-Type", "application/json")
 
-        print(f"Resolving {smtp_server} (IPv4)...")
-        # Force IPv4 resolution
-        addr_info = socket.getaddrinfo(smtp_server, smtp_port, family=socket.AF_INET, proto=socket.IPPROTO_TCP)
-        smtp_ip = addr_info[0][4][0]
-        print(f"Resolved to {smtp_ip}. Connecting to Port {smtp_port} (587/STARTTLS)...")
+        print(f"Sending login notification via Resend for {user_email}...")
 
-        # Connect using standard SMTP (not SSL) for Port 587
-        server = smtplib.SMTP(smtp_ip, smtp_port, timeout=30)
-        server.set_debuglevel(1) # Enable low-level SMTP logs
-        
-        print("Connected. Starting TLS...")
-        
-        # Create context that doesn't check hostname (since we depend on IP)
-        import ssl
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        
-        server.starttls(context=context) 
-        
-        print("Logging in...")
-        server.login(sender_email, sender_password)
-        
-        print("Sending mail...")
-        server.sendmail(sender_email, receiver_email, msg_container.as_string())
-        server.quit()
-        
-        print(f"Login notification sent for {user_email}")
-        return True, "Email sent successfully"
+        with urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode())
+            print(f"Email sent successfully. Resend ID: {result.get('id')}")
+            return True, "Email sent successfully"
 
+    except HTTPError as e:
+        body = e.read().decode()
+        error_msg = f"Resend API error ({e.code}): {body}"
+        print(error_msg)
+        logger.error(error_msg)
+        return False, error_msg
+    except URLError as e:
+        error_msg = f"Network error sending email: {str(e)}"
+        print(error_msg)
+        logger.error(error_msg)
+        return False, error_msg
     except Exception as e:
         error_msg = f"Failed to send email: {str(e)}"
-        print(error_msg) # Print to stdout to ensure visibility in Render logs
+        print(error_msg)
         logger.error(error_msg)
         return False, error_msg
