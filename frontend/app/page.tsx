@@ -7,6 +7,7 @@ import { Loader2, Download, CheckCircle, AlertCircle, Sparkles, X } from "lucide
 import { motion } from "framer-motion"
 import { BackgroundBeams } from "@/components/ui/background-beams"
 import { fitUpload, splitUploads } from "@/lib/upload-batches"
+import { loadArchive, pruneSavedArchives } from "@/lib/billing-downloads"
 
 const apiUrl = "/api"
 const jobKey = "billing_job"
@@ -15,6 +16,8 @@ const isJobId = (id: unknown): id is string => typeof id === "string" && /^[a-f0
 type Status = "idle" | "processing" | "success" | "error" | "paused"
 type DownloadPart = { id: string, total: number, skipped: number, review: number }
 type UploadQueue = { batches: File[][], next: number, results: DownloadPart[] }
+
+class MissingJob extends Error {}
 
 function readStorage(key: string) {
   try { return sessionStorage.getItem(key) } catch { return null }
@@ -52,11 +55,15 @@ export default function Dashboard() {
   const [elapsed, setElapsed] = useState(0)
   const [jobId, setJobId] = useState<string | null>(null)
   const [downloads, setDownloads] = useState<DownloadPart[]>([])
+  const [downloadLinks, setDownloadLinks] = useState<Record<string, string>>({})
+  const [downloadNotice, setDownloadNotice] = useState("")
   const [cancelPending, setCancelPending] = useState(false)
   const uploadController = useRef<AbortController | null>(null)
   const activeJob = useRef<string | null>(null)
   const queue = useRef<UploadQueue | null>(null)
   const completed = useRef<DownloadPart[]>([])
+  const uncheckedDownloads = useRef<DownloadPart[]>([])
+  const archiveUrls = useRef(new Map<string, string>())
 
   const setActiveJob = useCallback((id: string | null) => {
     activeJob.current = id
@@ -67,7 +74,21 @@ export default function Dashboard() {
   const saveDownloads = useCallback((parts: DownloadPart[]) => {
     completed.current = parts
     setDownloads(parts)
-    writeStorage(downloadKey, JSON.stringify(parts))
+    const saved = new Map([...uncheckedDownloads.current, ...parts].map(part => [part.id, part]))
+    writeStorage(downloadKey, JSON.stringify([...saved.values()]))
+  }, [])
+
+  const rememberArchive = useCallback(async (id: string, signal: AbortSignal) => {
+    if (archiveUrls.current.has(id)) return true
+    const blob = await loadArchive(id, signal)
+    signal.throwIfAborted()
+    if (!blob) return false
+    if (!archiveUrls.current.has(id)) {
+      const url = URL.createObjectURL(blob)
+      archiveUrls.current.set(id, url)
+      setDownloadLinks(links => ({ ...links, [id]: url }))
+    }
+    return true
   }, [])
 
   useEffect(() => {
@@ -93,7 +114,7 @@ export default function Dashboard() {
         if (++failures >= 3) throw new Error("Could not check this batch. Resume it to try again.")
         setMessage(prefix + "Connection interrupted. Reconnecting...")
       } else {
-        if (response.status === 404) setActiveJob(null)
+        if (response.status === 404) throw new MissingJob("The server no longer has this batch.")
         const job = await readResponse(response, "Unable to check this batch.")
         failures = 0
         if (job.status === "error" || job.status === "cancelled") {
@@ -114,6 +135,7 @@ export default function Dashboard() {
   const processQueue = useCallback(async (signal: AbortSignal) => {
     const pending = queue.current
     const results = pending?.results ?? []
+    let retriedPart = -1
     while (activeJob.current || (pending && pending.next < pending.batches.length)) {
       signal.throwIfAborted()
       const batch = pending?.batches[pending.next]
@@ -138,7 +160,31 @@ export default function Dashboard() {
         setActiveJob(id)
       }
       if (!id) break
-      const part = await trackJob(id, prefix, AbortSignal.any([signal, AbortSignal.timeout(270_000)]))
+      let part: DownloadPart
+      try {
+        part = await trackJob(id, prefix, AbortSignal.any([signal, AbortSignal.timeout(270_000)]))
+        setMessage(prefix + "Saving Excel ZIP...")
+        let saved: boolean
+        try {
+          saved = await rememberArchive(id, signal)
+        } catch (error) {
+          signal.throwIfAborted()
+          throw new Error("Could not retrieve the finished ZIP. Resume the batch to try again.", { cause: error })
+        }
+        if (!saved) throw new MissingJob("The server no longer has this ZIP.")
+      } catch (error) {
+        if (!(error instanceof MissingJob)) throw error
+        setActiveJob(null)
+        if (pending && batch && retriedPart !== pending.next) {
+          retriedPart = pending.next
+          setMessage(prefix + "The server lost this part. Retrying it...")
+          await new Promise(resolve => window.setTimeout(resolve, 1500))
+          continue
+        }
+        throw new Error(batch
+          ? "This part was lost again. Process the remaining posters to retry."
+          : "This batch is no longer on the server. Select its posters again to retry.")
+      }
       signal.throwIfAborted()
       saveDownloads([...completed.current.filter(previous => previous.id !== part.id), part])
       results.push(part)
@@ -157,7 +203,7 @@ export default function Dashboard() {
       ? `${count} posters exported. ${skipped} skipped, ${review} need review. See processing-report.txt in the ZIPs.`
       : count === 1 ? "1 poster exported." : `All ${count} posters exported.`)
     setStatus("success")
-  }, [saveDownloads, setActiveJob, trackJob])
+  }, [rememberArchive, saveDownloads, setActiveJob, trackJob])
 
   const run = useCallback(async () => {
     if (uploadController.current) return
@@ -186,8 +232,33 @@ export default function Dashboard() {
   }, [processQueue])
 
   useEffect(() => {
+    const restoreController = new AbortController()
+    const urls = archiveUrls.current
     const restore = window.setTimeout(() => {
-      saveDownloads(readDownloads())
+      const oldDownloads = readDownloads()
+      void pruneSavedArchives().catch(() => undefined)
+      void (async () => {
+        const available: DownloadPart[] = []
+        let expired = 0
+        const unchecked: DownloadPart[] = []
+        for (const part of oldDownloads) {
+          if (restoreController.signal.aborted) return
+          try {
+            if (await rememberArchive(part.id, restoreController.signal)) available.push(part)
+            else expired++
+          } catch {
+            unchecked.push(part)
+          }
+        }
+        if (restoreController.signal.aborted) return
+        uncheckedDownloads.current = unchecked
+        const merged = new Map([...available, ...completed.current].map(part => [part.id, part]))
+        saveDownloads([...merged.values()])
+        setDownloadNotice([
+          expired ? "Expired download links were removed." : "",
+          unchecked.length ? "Some downloads could not be checked. Refresh to retry." : "",
+        ].filter(Boolean).join(" "))
+      })()
       const id = readStorage(jobKey)
       if (isJobId(id)) {
         setActiveJob(id)
@@ -197,11 +268,14 @@ export default function Dashboard() {
     }, 0)
     return () => {
       window.clearTimeout(restore)
+      restoreController.abort()
+      for (const url of urls.values()) URL.revokeObjectURL(url)
+      urls.clear()
       const controller = uploadController.current
       uploadController.current = null
       controller?.abort()
     }
-  }, [run, saveDownloads, setActiveJob])
+  }, [rememberArchive, run, saveDownloads, setActiveJob])
 
   const handleUpload = () => {
     if (!files.length || uploadController.current || activeJob.current) return
@@ -319,12 +393,14 @@ export default function Dashboard() {
                 </div>
               )}
 
+              {downloadNotice && <p role="status" className="text-sm text-neutral-400">{downloadNotice}</p>}
+
               {downloads.length > 0 && (
                 <ul aria-label="Completed downloads" className="max-h-64 space-y-2 overflow-y-auto">
                   {downloads.map((part, index) => (
                     <li key={part.id}>
                       <Button asChild size="lg" className="w-full bg-white text-black hover:bg-neutral-200">
-                        <a href={`${apiUrl}/jobs/${part.id}/download`}>
+                        <a href={downloadLinks[part.id]} download={`billing_${part.id.slice(0, 8)}.zip`}>
                           <Download className="mr-2 h-4 w-4 shrink-0" />
                           {downloads.length === 1 ? "Download Excel ZIP" : `Download ZIP ${index + 1}`}
                         </a>
