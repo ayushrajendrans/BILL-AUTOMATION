@@ -1,5 +1,8 @@
 import io
 import logging
+import re
+import unicodedata
+from calendar import monthrange
 
 import openpyxl
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -8,13 +11,45 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
+THUMBNAIL_SIZE = (210, 190)
+MONTHS = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def normalize_club(name):
+    return " ".join(unicodedata.normalize("NFKC", name).split()).upper()
+
+
+def normalize_month(value):
+    name = value.strip().casefold()
+    return next((month for month in MONTHS if name in (month.casefold(), month[:3].casefold())), "")
+
+
+def month_from_date(date):
+    match = re.fullmatch(r"(\d{1,2})[-\s]+([a-zA-Z]+)", date.strip())
+    if not match:
+        return ""
+    day, name = match.groups()
+    month = normalize_month(name)
+    return month if month and 1 <= int(day) <= monthrange(2000, MONTHS.index(month) + 1)[1] else ""
+
+
+def make_thumbnail(image_bytes):
+    with Image.open(io.BytesIO(image_bytes)) as source:
+        image = ImageOps.exif_transpose(source)
+        image.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.convert("RGB").save(output, format="JPEG", quality=86, optimize=True)
+    return output.getvalue()
 
 
 def create_excel_with_images(data_list):
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     sheet.title = "Billing Data"
-    sheet.append(["Date", "Club Name", "Poster Image"])
+    sheet.append(["Date", "Club Name", "Month", "Poster Image"])
     sheet.freeze_panes = "A2"
 
     for cell in sheet[1]:
@@ -24,29 +59,25 @@ def create_excel_with_images(data_list):
 
     sheet.column_dimensions["A"].width = 15
     sheet.column_dimensions["B"].width = 30
-    sheet.column_dimensions["C"].width = 32
+    sheet.column_dimensions["C"].width = 15
+    sheet.column_dimensions["D"].width = 32
 
     for row, item in enumerate(data_list, start=2):
         sheet.row_dimensions[row].height = 150
-        for column, field in ((1, "date"), (2, "club_name")):
-            value = ILLEGAL_CHARACTERS_RE.sub("", item.get(field, ""))
+        for column, text in ((1, item.get("date", "")), (2, item.get("club_name", "")),
+                             (3, month_from_date(item.get("date", "")) or normalize_month(item.get("month", "")))):
+            value = ILLEGAL_CHARACTERS_RE.sub("", text)
             cell = sheet.cell(row=row, column=column, value=value)
             cell.data_type = "s"
             cell.alignment = Alignment(vertical="center", wrap_text=True)
 
-        image_bytes = item.get("image_bytes")
-        if image_bytes:
+        if item.get("thumbnail") or item.get("image_bytes"):
             try:
-                with Image.open(io.BytesIO(image_bytes)) as source:
-                    image = ImageOps.exif_transpose(source)
-                    image.thumbnail((210, 190), Image.Resampling.LANCZOS)
-                    stream = io.BytesIO()
-                    image.save(stream, format="PNG")
-                stream.seek(0)
-                sheet.add_image(OpenpyxlImage(stream), f"C{row}")
+                stream = io.BytesIO(item.get("thumbnail") or make_thumbnail(item["image_bytes"]))
+                sheet.add_image(OpenpyxlImage(stream), f"D{row}")
             except (OSError, ValueError, Image.DecompressionBombError):
                 logger.warning("Unable to embed poster in worksheet row %s", row)
-                sheet.cell(row=row, column=3, value="[Image Error]")
+                sheet.cell(row=row, column=4, value="[Image Error]")
 
     output = io.BytesIO()
     workbook.save(output)

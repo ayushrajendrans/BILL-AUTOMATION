@@ -7,38 +7,16 @@ import { Loader2, Download, CheckCircle, AlertCircle, Sparkles, X } from "lucide
 import { motion } from "framer-motion"
 import { BackgroundBeams } from "@/components/ui/background-beams"
 import { fitUpload, splitUploads } from "@/lib/upload-batches"
-import { loadArchive, pruneSavedArchives } from "@/lib/billing-downloads"
 
 const apiUrl = "/api"
-const jobKey = "billing_job"
-const downloadKey = "billing_downloads"
 const isJobId = (id: unknown): id is string => typeof id === "string" && /^[a-f0-9]{32}$/.test(id)
 type Status = "idle" | "processing" | "success" | "error" | "paused"
-type DownloadPart = { id: string, total: number, skipped: number, review: number }
-type UploadQueue = { batches: File[][], next: number, results: DownloadPart[] }
+type PosterRow = { club_name: string, date: string, month: string, thumbnail: string }
+type PartSummary = { total: number, skipped: number, review: number }
+type PartResult = PartSummary & { rows: PosterRow[], notes: string[] }
+type UploadQueue = { batches: File[][], next: number, results: PartResult[], retried: Set<number> }
 
 class MissingJob extends Error {}
-
-function readStorage(key: string) {
-  try { return sessionStorage.getItem(key) } catch { return null }
-}
-
-function writeStorage(key: string, value: string | null) {
-  try {
-    if (value === null) sessionStorage.removeItem(key)
-    else sessionStorage.setItem(key, value)
-  } catch {
-    // Storage can be disabled without preventing uploads.
-  }
-}
-
-function readDownloads(): DownloadPart[] {
-  try {
-    const value = JSON.parse(readStorage(downloadKey) || "[]")
-    return Array.isArray(value) ? value.filter(part => isJobId(part?.id)
-      && Number.isFinite(part.total) && Number.isFinite(part.skipped) && Number.isFinite(part.review)) : []
-  } catch { return [] }
-}
 
 async function readResponse(response: Response, fallback: string) {
   const body = await response.json().catch(() => null)
@@ -54,41 +32,24 @@ export default function Dashboard() {
   const [message, setMessage] = useState("")
   const [elapsed, setElapsed] = useState(0)
   const [jobId, setJobId] = useState<string | null>(null)
-  const [downloads, setDownloads] = useState<DownloadPart[]>([])
-  const [downloadLinks, setDownloadLinks] = useState<Record<string, string>>({})
-  const [downloadNotice, setDownloadNotice] = useState("")
+  const [downloadUrl, setDownloadUrl] = useState("")
+  const [canResume, setCanResume] = useState(false)
+  const [canExportPartial, setCanExportPartial] = useState(false)
   const [cancelPending, setCancelPending] = useState(false)
   const uploadController = useRef<AbortController | null>(null)
   const activeJob = useRef<string | null>(null)
   const queue = useRef<UploadQueue | null>(null)
-  const completed = useRef<DownloadPart[]>([])
-  const uncheckedDownloads = useRef<DownloadPart[]>([])
-  const archiveUrls = useRef(new Map<string, string>())
+  const archiveUrl = useRef("")
 
   const setActiveJob = useCallback((id: string | null) => {
     activeJob.current = id
     setJobId(id)
-    writeStorage(jobKey, id)
   }, [])
 
-  const saveDownloads = useCallback((parts: DownloadPart[]) => {
-    completed.current = parts
-    setDownloads(parts)
-    const saved = new Map([...uncheckedDownloads.current, ...parts].map(part => [part.id, part]))
-    writeStorage(downloadKey, JSON.stringify([...saved.values()]))
-  }, [])
-
-  const rememberArchive = useCallback(async (id: string, signal: AbortSignal) => {
-    if (archiveUrls.current.has(id)) return true
-    const blob = await loadArchive(id, signal)
-    signal.throwIfAborted()
-    if (!blob) return false
-    if (!archiveUrls.current.has(id)) {
-      const url = URL.createObjectURL(blob)
-      archiveUrls.current.set(id, url)
-      setDownloadLinks(links => ({ ...links, [id]: url }))
-    }
-    return true
+  const replaceDownload = useCallback((url: string) => {
+    if (archiveUrl.current) URL.revokeObjectURL(archiveUrl.current)
+    archiveUrl.current = url
+    setDownloadUrl(url)
   }, [])
 
   useEffect(() => {
@@ -98,7 +59,7 @@ export default function Dashboard() {
     return () => window.clearInterval(timer)
   }, [status])
 
-  const trackJob = useCallback(async (id: string, prefix: string, signal: AbortSignal): Promise<DownloadPart> => {
+  const trackJob = useCallback(async (id: string, prefix: string, signal: AbortSignal): Promise<PartSummary> => {
     let failures = 0
     while (!signal.aborted) {
       let response: Response | null = null
@@ -111,18 +72,18 @@ export default function Dashboard() {
         if (signal.aborted) throw error
       }
       if (!response || response.status >= 500) {
-        if (++failures >= 3) throw new Error("Could not check this batch. Resume it to try again.")
+        if (++failures >= 4) throw new Error("Could not check this part. Resume to reconnect.")
         setMessage(prefix + "Connection interrupted. Reconnecting...")
       } else {
-        if (response.status === 404) throw new MissingJob("The server no longer has this batch.")
-        const job = await readResponse(response, "Unable to check this batch.")
+        if (response.status === 404) throw new MissingJob("The server no longer has this part.")
+        const job = await readResponse(response, "Unable to check this part.")
         failures = 0
         if (job.status === "error" || job.status === "cancelled") {
           setActiveJob(null)
-          throw new Error(job.message || "This batch did not finish.")
+          throw new Error(job.message || "This part did not finish.")
         }
         if (job.status === "ready") {
-          return { id, total: job.total, skipped: Number(job.failed) || 0, review: Number(job.review) || 0 }
+          return { total: job.total, skipped: Number(job.failed) || 0, review: Number(job.review) || 0 }
         }
         setMessage(`${prefix}${job.stage}: ${job.completed} of ${job.total} posters checked.`)
       }
@@ -132,19 +93,19 @@ export default function Dashboard() {
     throw new Error("Batch tracking stopped.")
   }, [setActiveJob])
 
-  const processQueue = useCallback(async (signal: AbortSignal) => {
+  const processQueue = useCallback(async (signal: AbortSignal, exportPartial: boolean) => {
     const pending = queue.current
-    const results = pending?.results ?? []
-    let retriedPart = -1
-    while (activeJob.current || (pending && pending.next < pending.batches.length)) {
+    if (!pending) return
+    while (!exportPartial && pending.next < pending.batches.length) {
       signal.throwIfAborted()
-      const batch = pending?.batches[pending.next]
-      const prefix = pending && pending.batches.length > 1
+      const batch = pending.batches[pending.next]
+      const prefix = pending.batches.length > 1
         ? `Part ${pending.next + 1} of ${pending.batches.length}: ` : ""
       let id = activeJob.current
-      if (!id && batch) {
+      if (!id) {
         setMessage(prefix + "Uploading posters...")
         const formData = new FormData()
+        formData.append("extract_only", "true")
         for (const file of batch) {
           const upload = await fitUpload(file)
           signal.throwIfAborted()
@@ -155,76 +116,92 @@ export default function Dashboard() {
           signal: AbortSignal.any([signal, AbortSignal.timeout(125_000)]),
         })
         const result = await readResponse(response, "The billing service could not accept this upload.")
-        if (!isJobId(result.id)) throw new Error("The billing service returned an invalid batch ID.")
-        id = result.id
+        const createdId: unknown = result.id
+        if (!isJobId(createdId)) throw new Error("The billing service returned an invalid batch ID.")
+        id = createdId
         setActiveJob(id)
       }
-      if (!id) break
-      let part: DownloadPart
+
       try {
-        part = await trackJob(id, prefix, AbortSignal.any([signal, AbortSignal.timeout(270_000)]))
-        setMessage(prefix + "Saving Excel ZIP...")
-        let saved: boolean
-        try {
-          saved = await rememberArchive(id, signal)
-        } catch (error) {
-          signal.throwIfAborted()
-          throw new Error("Could not retrieve the finished ZIP. Resume the batch to try again.", { cause: error })
+        const part = await trackJob(id, prefix, AbortSignal.any([signal, AbortSignal.timeout(270_000)]))
+        const response = await fetch(`${apiUrl}/jobs/${id}/results`, {
+          signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]),
+          cache: "no-store",
+        })
+        if (response.status === 404) throw new MissingJob("The server no longer has this part.")
+        const data = await readResponse(response, "Could not retrieve the extracted poster details. Resume to try again.")
+        if (!Array.isArray(data.rows) || !data.rows.length || !Array.isArray(data.notes)) {
+          throw new Error("The billing service returned invalid poster details.")
         }
-        if (!saved) throw new MissingJob("The server no longer has this ZIP.")
+        signal.throwIfAborted()
+        pending.results.push({ ...part, rows: data.rows, notes: data.notes })
+        pending.next++
+        setCanExportPartial(true)
+        setActiveJob(null)
+        const processed = new Set(batch)
+        setFiles(current => current.filter(file => !processed.has(file)))
       } catch (error) {
         if (!(error instanceof MissingJob)) throw error
         setActiveJob(null)
-        if (pending && batch && retriedPart !== pending.next) {
-          retriedPart = pending.next
-          setMessage(prefix + "The server lost this part. Retrying it...")
-          await new Promise(resolve => window.setTimeout(resolve, 1500))
-          continue
+        if (pending.retried.has(pending.next)) {
+          throw new Error("The server lost this part again. Resume to retry the remaining posters.")
         }
-        throw new Error(batch
-          ? "This part was lost again. Process the remaining posters to retry."
-          : "This batch is no longer on the server. Select its posters again to retry.")
-      }
-      signal.throwIfAborted()
-      saveDownloads([...completed.current.filter(previous => previous.id !== part.id), part])
-      results.push(part)
-      setActiveJob(null)
-      if (pending) pending.next++
-      if (batch && part.skipped === 0) {
-        const exported = new Set(batch)
-        setFiles(current => current.filter(file => !exported.has(file)))
+        pending.retried.add(pending.next)
+        setMessage(prefix + "The server lost this part. Retrying it...")
+        await new Promise(resolve => window.setTimeout(resolve, 1500))
       }
     }
-    queue.current = null
-    const count = results.reduce((sum, part) => sum + part.total - part.skipped, 0)
-    const skipped = results.reduce((sum, part) => sum + part.skipped, 0)
-    const review = results.reduce((sum, part) => sum + part.review, 0)
-    setMessage(skipped || review
-      ? `${count} posters exported. ${skipped} skipped, ${review} need review. See processing-report.txt in the ZIPs.`
-      : count === 1 ? "1 poster exported." : `All ${count} posters exported.`)
-    setStatus("success")
-  }, [rememberArchive, saveDownloads, setActiveJob, trackJob])
 
-  const run = useCallback(async () => {
-    if (uploadController.current) return
+    const rows = pending.results.flatMap(part => part.rows)
+    const notes = pending.results.flatMap(part => part.notes)
+    const skipped = pending.results.reduce((sum, part) => sum + part.skipped, 0)
+    const review = pending.results.reduce((sum, part) => sum + part.review, 0)
+    if (!rows.length) throw new Error("No posters were processed. Try again.")
+    setMessage("Grouping posters by club and creating the Excel ZIP...")
+    const response = await fetch(`${apiUrl}/exports`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rows, notes }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(115_000)]),
+    })
+    if (!response.ok) await readResponse(response, "Could not build the Excel ZIP. Resume to try again.")
+    if (!response.headers.get("Content-Type")?.includes("application/zip")) {
+      throw new Error("The server did not return an Excel ZIP. Resume to try again.")
+    }
+    const archive = await response.blob()
+    signal.throwIfAborted()
+    replaceDownload(URL.createObjectURL(archive))
+    queue.current = null
+    setCanResume(false)
+    setCanExportPartial(false)
+    const exported = `${rows.length} poster${rows.length === 1 ? "" : "s"} exported.`
+    setMessage([
+      exported,
+      exportPartial ? "This ZIP includes only the posters processed so far." : "",
+      skipped || review ? `${skipped} skipped, ${review} need review. See processing-report.txt in the ZIP.` : "",
+    ].filter(Boolean).join(" "))
+    setStatus("success")
+  }, [replaceDownload, setActiveJob, trackJob])
+
+  const run = useCallback(async (exportPartial = false) => {
+    if (uploadController.current || !queue.current) return
     const controller = new AbortController()
     uploadController.current = controller
     setElapsed(0)
     setStatus("processing")
     try {
-      await processQueue(controller.signal)
+      await processQueue(controller.signal, exportPartial)
     } catch (error) {
       if (uploadController.current !== controller || controller.signal.reason === "cancel") return
       if (controller.signal.reason === "pause") {
         setStatus("paused")
-        setMessage("Tracking paused. Resume to continue this selection.")
+        setMessage("Processing paused. Resume to continue this selection.")
       } else {
-        if (!activeJob.current) queue.current = null
         setStatus("error")
         setMessage(error instanceof DOMException && error.name === "TimeoutError"
-          ? activeJob.current ? "Waiting timed out. Resume the batch to check its result." : "Upload timed out. Please try again."
+          ? "The request timed out. Resume to try again without losing completed posters."
           : error instanceof Error && error.message !== "Failed to fetch"
-            ? error.message : "Could not connect to the billing service. Check that the backend is running.")
+            ? error.message : "Could not connect to the billing service. Resume to try again.")
       }
     } finally {
       if (uploadController.current === controller) uploadController.current = null
@@ -232,60 +209,35 @@ export default function Dashboard() {
   }, [processQueue])
 
   useEffect(() => {
-    const restoreController = new AbortController()
-    const urls = archiveUrls.current
-    const restore = window.setTimeout(() => {
-      const oldDownloads = readDownloads()
-      void pruneSavedArchives().catch(() => undefined)
-      void (async () => {
-        const available: DownloadPart[] = []
-        let expired = 0
-        const unchecked: DownloadPart[] = []
-        for (const part of oldDownloads) {
-          if (restoreController.signal.aborted) return
-          try {
-            if (await rememberArchive(part.id, restoreController.signal)) available.push(part)
-            else expired++
-          } catch {
-            unchecked.push(part)
-          }
-        }
-        if (restoreController.signal.aborted) return
-        uncheckedDownloads.current = unchecked
-        const merged = new Map([...available, ...completed.current].map(part => [part.id, part]))
-        saveDownloads([...merged.values()])
-        setDownloadNotice([
-          expired ? "Expired download links were removed." : "",
-          unchecked.length ? "Some downloads could not be checked. Refresh to retry." : "",
-        ].filter(Boolean).join(" "))
-      })()
-      const id = readStorage(jobKey)
-      if (isJobId(id)) {
-        setActiveJob(id)
-        setMessage("Checking your previous batch...")
-        void run()
-      }
-    }, 0)
+    try {
+      sessionStorage.removeItem("billing_job")
+      sessionStorage.removeItem("billing_downloads")
+    } catch {
+      // Storage can be disabled without preventing uploads.
+    }
+    void window.caches?.delete("billing-archives-v1").catch(() => undefined)
     return () => {
-      window.clearTimeout(restore)
-      restoreController.abort()
-      for (const url of urls.values()) URL.revokeObjectURL(url)
-      urls.clear()
+      if (archiveUrl.current) URL.revokeObjectURL(archiveUrl.current)
+      archiveUrl.current = ""
       const controller = uploadController.current
       uploadController.current = null
       controller?.abort()
     }
-  }, [rememberArchive, run, saveDownloads, setActiveJob])
+  }, [])
 
   const handleUpload = () => {
-    if (!files.length || uploadController.current || activeJob.current) return
-    queue.current = { batches: splitUploads(files), next: 0, results: [] }
+    if (!files.length || uploadController.current || queue.current) return
+    replaceDownload("")
+    queue.current = { batches: splitUploads(files), next: 0, results: [], retried: new Set() }
+    setCanResume(true)
     void run()
   }
 
   const resume = () => {
-    if (!activeJob.current && !queue.current) return
-    setMessage("Checking your batch...")
+    const pending = queue.current
+    if (!pending) return
+    pending.retried.delete(pending.next)
+    setMessage("Resuming processing...")
     void run()
   }
 
@@ -298,14 +250,19 @@ export default function Dashboard() {
         const response = await fetch(`${apiUrl}/jobs/${id}`, {
           method: "DELETE", signal: AbortSignal.timeout(12_000),
         })
-        if (!response.ok && response.status !== 404) {
-          throw new Error("Could not cancel this batch.")
-        }
+        if (!response.ok && response.status !== 404) throw new Error("Could not cancel this part.")
       }
-      queue.current = null
       setActiveJob(null)
-      setStatus("idle")
-      setMessage("")
+      if ((id || status === "processing") && queue.current?.results.length) {
+        setStatus("paused")
+        setMessage("Processing stopped. Resume or export the posters already processed.")
+      } else {
+        queue.current = null
+        setCanResume(false)
+        setCanExportPartial(false)
+        setStatus("idle")
+        setMessage("")
+      }
     } catch {
       setStatus("error")
       setMessage("Could not cancel the batch. Resume to check whether it is still running.")
@@ -362,7 +319,7 @@ export default function Dashboard() {
                 <FileUpload
                   files={files}
                   onFilesSelected={setFiles}
-                  isProcessing={status === "processing" || status === "paused" || jobId !== null}
+                  isProcessing={canResume}
                 />
               </div>
 
@@ -393,21 +350,13 @@ export default function Dashboard() {
                 </div>
               )}
 
-              {downloadNotice && <p role="status" className="text-sm text-neutral-400">{downloadNotice}</p>}
-
-              {downloads.length > 0 && (
-                <ul aria-label="Completed downloads" className="max-h-64 space-y-2 overflow-y-auto">
-                  {downloads.map((part, index) => (
-                    <li key={part.id}>
-                      <Button asChild size="lg" className="w-full bg-white text-black hover:bg-neutral-200">
-                        <a href={downloadLinks[part.id]} download={`billing_${part.id.slice(0, 8)}.zip`}>
-                          <Download className="mr-2 h-4 w-4 shrink-0" />
-                          {downloads.length === 1 ? "Download Excel ZIP" : `Download ZIP ${index + 1}`}
-                        </a>
-                      </Button>
-                    </li>
-                  ))}
-                </ul>
+              {downloadUrl && (
+                <Button asChild size="lg" className="w-full bg-white text-black hover:bg-neutral-200">
+                  <a href={downloadUrl} download="billing_files.zip">
+                    <Download className="mr-2 h-4 w-4 shrink-0" />
+                    Download Excel ZIP
+                  </a>
+                </Button>
               )}
 
               <div className="flex flex-wrap justify-end gap-3 pt-4">
@@ -416,19 +365,24 @@ export default function Dashboard() {
                     Pause tracking
                   </Button>
                 )}
-                {(status === "processing" || status === "paused" || (jobId && status === "error")) && (
+                {canResume && (
                   <Button variant="outline" onClick={cancel} disabled={cancelPending}>
                     <X className="mr-2 h-4 w-4" />
-                    Cancel batch
+                    {status === "processing" || jobId ? "Cancel batch" : "Discard batch"}
                   </Button>
                 )}
-                {(status === "paused" || (jobId && status === "error")) && (
-                  <Button variant="outline" onClick={resume} disabled={cancelPending}>Resume batch</Button>
+                {canResume && (status === "paused" || status === "error") && (
+                  <Button variant="outline" onClick={resume} disabled={cancelPending}>Resume processing</Button>
+                )}
+                {canExportPartial && !jobId && (status === "paused" || status === "error") && (
+                  <Button variant="outline" onClick={() => void run(true)} disabled={cancelPending}>
+                    <Download className="mr-2 h-4 w-4" /> Export processed posters
+                  </Button>
                 )}
                 <Button
                   size="lg"
                   onClick={handleUpload}
-                  disabled={files.length === 0 || status === "processing" || status === "paused" || cancelPending || jobId !== null}
+                  disabled={files.length === 0 || canResume || cancelPending}
                   className="w-full sm:w-auto bg-white text-black hover:bg-neutral-200 transition-all duration-300 shadow-[0_0_20px_rgba(255,255,255,0.3)] hover:shadow-[0_0_30px_rgba(255,255,255,0.5)]"
                 >
                   {status === 'processing' ? (

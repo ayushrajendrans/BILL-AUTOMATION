@@ -40,18 +40,18 @@ GitHub Models has been retired. Replace legacy `OPENAI_API_KEY` configuration
 with a Gemini key in `GEMINI_API_KEY`.
 
 Select your JPG, PNG, or WEBP posters together. Large selections are split into
-uploads automatically, and each completed part has a ZIP download. An image
-larger than one upload is resized in the browser. If the server loses an active
-part while the selected files are still open, the browser retries that part once.
-Refreshing restores the active part and checks completed download links in that
-tab; any files not yet sent need to be selected again.
+uploads automatically. The app combines results from all parts into one ZIP,
+with a workbook for each club. Each workbook lists the date, club, month, and
+poster. An image larger than one upload is resized in the browser. If the
+server loses an active part, the app retries it once while the page is open.
+Keep the page open during processing; refreshing clears the selection and the
+download button. It does not delete files you have already downloaded.
 
 If some posters fail, successful ones still appear in the ZIP.
 `processing-report.txt` lists skipped posters and any details to review.
-The backend retains the latest 20 batches for up to one hour. The browser also
-keeps copies of completed ZIPs for up to 24 hours when local storage is available,
-so a backend restart does not remove those downloads. Missing links are removed
-on refresh. ZIP input is not supported.
+The app keeps completed parts in the current page while processing. If a later
+part fails, you can resume or export the posters already processed. ZIP input is
+not supported.
 
 ### 2. Frontend Setup
 ```bash

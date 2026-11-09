@@ -268,6 +268,59 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(workbook.active["A2"].value, "=1+1")
                 self.assertEqual(workbook.active["A2"].data_type, "s")
 
+    async def test_combined_export_groups_clubs_across_parts_and_server_restart(self):
+        analyze = AsyncMock(side_effect=[
+            {"club_name": " North  Club ", "event_date": "08-Oct", "event_month": "September"},
+            {"club_name": "South Club", "event_date": "UNKNOWN_DATE", "event_month": "November"},
+            {"club_name": "north club", "event_date": "12-Nov", "event_month": "November"},
+        ])
+        async with self.client_class(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client, asyncio.timeout(5):
+            parts = []
+            with patch("app.main.analyze_image_with_gemini", analyze):
+                for count in (2, 1):
+                    response = await client.post("/jobs", data={"extract_only": "true"}, files=[
+                        ("files", (f"poster-{index}.png", sample_poster(), "image/png"))
+                        for index in range(count)
+                    ])
+                    self.assertEqual(response.status_code, 202)
+                    job_id = response.json()["id"]
+                    self.addCleanup(lambda job_id=job_id: jobs.pop(job_id, None))
+                    await jobs[job_id]["task"]
+                    result = await client.get(f"/jobs/{job_id}/results")
+                    self.assertEqual(result.status_code, 200)
+                    parts.append(result.json())
+                    # Simulate losing all server-side state for this completed part.
+                    jobs.pop(job_id)
+            response = await client.post("/exports", json={
+                "rows": [row for part in parts for row in part["rows"]],
+                "notes": [note for part in parts for note in part["notes"]],
+            })
+        self.assertEqual(response.status_code, 200, response.text if not response.is_success else "")
+        self.assertEqual(analyze.await_count, 3)
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            self.assertEqual(set(archive.namelist()), {"NORTH CLUB.xlsx", "SOUTH CLUB.xlsx", "processing-report.txt"})
+            north = load_workbook(io.BytesIO(archive.read("NORTH CLUB.xlsx"))).active
+            south = load_workbook(io.BytesIO(archive.read("SOUTH CLUB.xlsx"))).active
+            self.assertEqual(list(north.values), [
+                ("Date", "Club Name", "Month", "Poster Image"),
+                ("08-Oct", "NORTH CLUB", "October", None),
+                ("12-Nov", "NORTH CLUB", "November", None),
+            ])
+            self.assertEqual(list(south.values)[1], ("UNKNOWN_DATE", "SOUTH CLUB", "November", None))
+            self.assertEqual(len(north._images), 2)
+            self.assertEqual(len(south._images), 1)
+
+    async def test_export_rejects_invalid_thumbnail(self):
+        async with self.client_class(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post("/exports", json={
+                "rows": [{"club_name": "TEST", "date": "08-Oct", "thumbnail": "not base64"}]
+            })
+        self.assertEqual(response.status_code, 422)
+
 
 if __name__ == "__main__":
     unittest.main()

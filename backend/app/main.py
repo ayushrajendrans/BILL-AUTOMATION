@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import io
 import logging
 import os
@@ -9,12 +11,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
+from PIL import Image
+from pydantic import BaseModel, Field, ValidationError
 
 from app.services.ai_service import AnalysisError, analyze_image_with_gemini, has_ai_configuration
-from app.services.excel_service import create_excel_with_images
+from app.services.excel_service import (
+    THUMBNAIL_SIZE,
+    create_excel_with_images,
+    make_thumbnail,
+    month_from_date,
+    normalize_club,
+    normalize_month,
+)
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -23,6 +34,7 @@ logger = logging.getLogger("uvicorn.error")
 BATCH_TIMEOUT = 240
 MAX_BATCH_BYTES = 95 * 1024 * 1024
 MAX_POSTERS = 50
+MAX_EXPORT_BYTES = 64 * 1024 * 1024
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 jobs = {}
 
@@ -43,9 +55,22 @@ class Poster:
 
 @dataclass
 class BatchResult:
-    archive: bytes
+    rows: list[dict]
+    notes: list[str]
     failed: int
     review: int
+
+
+class ExportRow(BaseModel):
+    club_name: str = Field(min_length=1, max_length=300)
+    date: str = Field(max_length=100)
+    month: str = Field(default="", max_length=20)
+    thumbnail: str = Field(default="", max_length=131072)
+
+
+class BillingExport(BaseModel):
+    rows: list[ExportRow] = Field(min_length=1)
+    notes: list[str] = Field(default_factory=list)
 
 
 def require_provider():
@@ -84,7 +109,7 @@ def get_job(job_id):
 
 
 @app.post("/jobs", status_code=202)
-async def start_job(files: list[UploadFile] = File(...)):
+async def start_job(files: list[UploadFile] = File(...), extract_only: bool = Form(False)):
     require_provider()
     posters = await read_posters(files)
     remove_expired_jobs()
@@ -107,9 +132,24 @@ async def start_job(files: list[UploadFile] = File(...)):
             job.update(stage=stage, completed=completed)
 
         try:
-            result = await build_bills(posters, progress)
-            job.update(status="ready", stage="Ready to download", completed=len(posters),
-                       archive=result.archive, failed=result.failed, review=result.review)
+            result = await build_bills(posters, progress, thumbnail_only=extract_only)
+            if extract_only:
+                job["results"] = {
+                    "rows": [
+                        {
+                            "club_name": row["club_name"],
+                            "date": row["date"],
+                            "month": row["month"],
+                            "thumbnail": base64.b64encode(row["thumbnail"]).decode("ascii"),
+                        }
+                        for row in result.rows
+                    ],
+                    "notes": result.notes,
+                }
+            else:
+                job["archive"] = await asyncio.to_thread(make_archive, result.rows, result.notes)
+            job.update(status="ready", stage="Ready", completed=len(posters),
+                       failed=result.failed, review=result.review)
         except HTTPException as error:
             job.update(status="error", message=str(error.detail))
         except asyncio.CancelledError:
@@ -153,20 +193,65 @@ async def download_job(job_id: str):
     job = get_job(job_id)
     if job["status"] != "ready":
         raise HTTPException(409, "This batch is not ready to download.")
+    if "archive" not in job:
+        raise HTTPException(409, "This part is awaiting the combined export.")
     return zip_response(job["archive"], f"billing_{job_id[:8]}.zip")
+
+
+@app.get("/jobs/{job_id}/results")
+async def job_results(job_id: str):
+    job = get_job(job_id)
+    if job["status"] != "ready" or "results" not in job:
+        raise HTTPException(409, "This part does not have extraction results yet.")
+    return JSONResponse(job["results"], headers={"Cache-Control": "no-store"})
+
+
+def export_rows(body):
+    try:
+        payload = BillingExport.model_validate_json(body)
+    except ValidationError as error:
+        raise HTTPException(422, "The export data is invalid or contains no posters.") from error
+    rows = []
+    for row in payload.rows:
+        try:
+            thumbnail = base64.b64decode(row.thumbnail, validate=True)
+            if thumbnail:
+                with Image.open(io.BytesIO(thumbnail)) as image:
+                    if (image.format != "JPEG" or image.width > THUMBNAIL_SIZE[0]
+                            or image.height > THUMBNAIL_SIZE[1]):
+                        raise ValueError("Unexpected thumbnail")
+                    image.load()
+        except (binascii.Error, ValueError, OSError, Image.DecompressionBombError) as error:
+            raise HTTPException(422, "A poster thumbnail is invalid.") from error
+        rows.append({"club_name": row.club_name, "date": row.date, "month": row.month,
+                     "thumbnail": thumbnail})
+    return make_archive(rows, payload.notes)
+
+
+@app.post("/exports")
+async def create_export(request: Request):
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_EXPORT_BYTES:
+            raise HTTPException(413, "The combined export is too large for the server.")
+        body.extend(chunk)
+    archive = await asyncio.to_thread(export_rows, body)
+    return zip_response(archive, "billing_files.zip")
 
 
 @app.post("/process-bills")
 async def process_bills(files: list[UploadFile] = File(...)):
     require_provider()
     result = await build_bills(await read_posters(files))
-    return zip_response(result.archive, "billing_files.zip")
+    archive = await asyncio.to_thread(make_archive, result.rows, result.notes)
+    return zip_response(archive, "billing_files.zip")
 
 
 def make_archive(rows, notes):
     clubs = {}
     for row in rows:
-        clubs.setdefault(row["club_name"], []).append(row)
+        club = normalize_club(row["club_name"]) or "UNKNOWN_CLUB"
+        clubs.setdefault(club, []).append({**row, "club_name": club})
 
     output = io.BytesIO()
     used_names = set()
@@ -185,7 +270,7 @@ def make_archive(rows, notes):
     return output.getvalue()
 
 
-async def build_bills(posters, progress=None):
+async def build_bills(posters, progress=None, thumbnail_only=False):
     semaphore = asyncio.Semaphore(2)
     completed = 0
     provider_failure = None
@@ -199,11 +284,19 @@ async def build_bills(posters, progress=None):
                 result = await analyze_image_with_gemini(poster.content, poster.mime_type)
                 if not result:
                     raise AnalysisError("No poster details could be extracted.", 422)
-                return {
-                    "club_name": result["club_name"].upper().strip(),
-                    "date": result["event_date"].strip(),
-                    "image_bytes": poster.content,
+                row = {
+                    "club_name": (normalize_club(result["club_name"]) or "UNKNOWN_CLUB")[:300],
+                    "date": result["event_date"].strip()[:100],
+                    "month": normalize_month(result.get("event_month", "")),
                 }
+                if thumbnail_only:
+                    try:
+                        row["thumbnail"] = await asyncio.to_thread(make_thumbnail, poster.content)
+                    except (OSError, ValueError, Image.DecompressionBombError):
+                        row["thumbnail"] = b""
+                else:
+                    row["image_bytes"] = poster.content
+                return row
             except AnalysisError as error:
                 if error.status_code in (401, 403, 429):
                     provider_failure = error
@@ -231,18 +324,22 @@ async def build_bills(posters, progress=None):
             errors.append(result)
             notes.append(f"Skipped {poster.filename}: {result}")
             continue
-        if result["club_name"] == "UNKNOWN_CLUB" or result["date"].upper() == "UNKNOWN_DATE":
+        unreadable = result["club_name"] == "UNKNOWN_CLUB" or not month_from_date(result["date"])
+        missing_thumbnail = thumbnail_only and not result["thumbnail"]
+        if unreadable or missing_thumbnail:
             review += 1
+        if unreadable:
             notes.append(f"Review {poster.filename}: club or date could not be read.")
+        if missing_thumbnail:
+            notes.append(f"Review {poster.filename}: the poster image could not be embedded.")
         rows.append(result)
 
     if not rows:
         first = errors[0]
         raise HTTPException(first.status_code, f"No posters processed. {first}")
     if progress:
-        progress("Generating Excel files", len(posters))
-    archive = await asyncio.to_thread(make_archive, rows, notes)
-    return BatchResult(archive=archive, failed=len(errors), review=review)
+        progress("Preparing results", len(posters))
+    return BatchResult(rows=rows, notes=notes, failed=len(errors), review=review)
 
 
 @app.get("/")
