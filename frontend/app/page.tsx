@@ -1,193 +1,200 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef, useCallback } from "react"
 import { FileUpload } from "@/components/file-upload"
 import { Button } from "@/components/ui/button"
-import { Loader2, Download, CheckCircle, AlertCircle, Sparkles, LogOut } from "lucide-react"
+import { Loader2, Download, CheckCircle, AlertCircle, Sparkles, X } from "lucide-react"
 import { motion } from "framer-motion"
 import { BackgroundBeams } from "@/components/ui/background-beams"
-import { TiltCard } from "@/components/ui/tilt-card"
-import { createClient } from "@/utils/supabase/client"
-import { useRouter } from "next/navigation"
+
+const apiUrl = "/api"
+const jobKey = "billing_job"
+type Status = "idle" | "processing" | "success" | "error" | "paused"
+
+function savedJob(id?: string | null) {
+  try {
+    if (id === undefined) {
+      const saved = sessionStorage.getItem(jobKey)
+      return saved && /^[a-f0-9]{32}$/.test(saved) ? saved : null
+    }
+    if (id) sessionStorage.setItem(jobKey, id)
+    else sessionStorage.removeItem(jobKey)
+  } catch {
+    // Storage can be disabled without preventing uploads.
+  }
+  return null
+}
+
+async function readResponse(response: Response, fallback: string) {
+  const body = await response.json().catch(() => null)
+  if (!response.ok || !body) {
+    throw new Error(typeof body?.detail === "string" ? body.detail : fallback)
+  }
+  return body
+}
 
 export default function Dashboard() {
   const [files, setFiles] = useState<File[]>([])
-  const [status, setStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle')
+  const [status, setStatus] = useState<Status>("idle")
   const [message, setMessage] = useState("")
-  const [user, setUser] = useState<any>(null)
-  const [loadingAuth, setLoadingAuth] = useState(true)
-
-  const router = useRouter()
-  const supabase = createClient()
-
-  const notifyLogin = async (user: any) => {
-    // Prevent duplicate notifications in the same session
-    if (sessionStorage.getItem("login_notified")) return;
-
-    try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL;
-      if (!apiUrl) {
-        console.error("NEXT_PUBLIC_API_URL is missing! Check Vercel Env Vars.");
-        return;
-      }
-      const response = await fetch(`${apiUrl}/notify-login`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          name: user.user_metadata?.full_name || "Unknown User",
-          email: user.email,
-        }),
-      });
-
-      const result = await response.json();
-
-      if (result.status === 'failed') {
-        console.error("Login notification failed:", result.message);
-      } else {
-        sessionStorage.setItem("login_notified", "true");
-        console.log("Login notification sent successfully.");
-      }
-    } catch (error) {
-      console.error("Failed to send login notification:", error);
-    }
-  }
+  const [elapsed, setElapsed] = useState(0)
+  const [jobId, setJobId] = useState<string | null>(null)
+  const [downloadUrl, setDownloadUrl] = useState("")
+  const [cancelPending, setCancelPending] = useState(false)
+  const uploadController = useRef<AbortController | null>(null)
 
   useEffect(() => {
-    console.log("Dashboard mounted, initiating auth check...");
+    if (status !== "processing") return
+    const started = Date.now()
+    const timer = window.setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000)
+    return () => window.clearInterval(timer)
+  }, [status])
 
-    // Check if env vars are loaded
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-    const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-    if (!supabaseUrl || !supabaseKey) {
-      console.error("CRITICAL: Supabase environment variables are missing!");
-      setMessage("Error: Supabase configuration missing. Check .env.local");
-      setStatus('error');
-      setLoadingAuth(false);
-      return;
-    }
-
-    const checkUser = async () => {
+  const trackJob = useCallback(async (id: string, signal: AbortSignal) => {
+    let failures = 0
+    while (!signal.aborted) {
+      let response: Response | null = null
       try {
-        console.log("Calling supabase.auth.getSession()...");
-        const { data, error } = await supabase.auth.getSession();
-
-        if (error) {
-          console.error("Supabase auth error:", error);
-          throw error;
-        }
-
-        if (!data.session?.user) {
-          console.log("No active session, redirecting to /login...");
-          router.push('/login')
-        } else {
-          console.log("Session found:", data.session.user.email);
-          setUser(data.session.user)
-          notifyLogin(data.session.user)
-        }
-      } catch (e) {
-        console.error("Error in checkUser (caught):", e);
-        console.log("Redirecting to /login due to error...");
-        router.push('/login');
-      } finally {
-        setLoadingAuth(false)
+        response = await fetch(`${apiUrl}/jobs/${id}`, {
+          signal: AbortSignal.any([signal, AbortSignal.timeout(12_000)]),
+          cache: "no-store",
+        })
+      } catch (error) {
+        if (signal.aborted) throw error
       }
+      if (!response || response.status >= 500) {
+        if (++failures >= 3) throw new Error("Could not check this batch. Resume it to try again.")
+        setMessage("Connection interrupted. Reconnecting...")
+      } else {
+        if (response.status === 404) {
+          savedJob(null)
+          setJobId(null)
+        }
+        const job = await readResponse(response, "Unable to check this batch.")
+        failures = 0
+        if (job.status === "error" || job.status === "cancelled") {
+          savedJob(null)
+          setJobId(null)
+          throw new Error(job.message || "This batch did not finish.")
+        }
+        if (job.status === "ready") {
+          const skipped = Number(job.failed) || 0
+          const review = Number(job.review) || 0
+          setDownloadUrl(`${apiUrl}/jobs/${id}/download`)
+          setMessage(skipped || review
+            ? `ZIP ready. ${job.total - skipped} of ${job.total} exported. ${skipped} skipped, ${review} need review. See processing-report.txt.`
+            : `Your Excel ZIP is ready. All ${job.total} posters exported.`)
+          setStatus("success")
+          return
+        }
+        setMessage(`${job.stage}: ${job.completed} of ${job.total} posters checked.`)
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 1000))
     }
-
-
-
-    checkUser()
+    signal.throwIfAborted()
   }, [])
 
-  const handleSignOut = async () => {
-    await supabase.auth.signOut()
-    sessionStorage.removeItem("login_notified")
-    router.push('/login')
+  const run = useCallback(async (operation: (signal: AbortSignal) => Promise<void>) => {
+    if (uploadController.current) return
+    const controller = new AbortController()
+    uploadController.current = controller
+    const timeout = window.setTimeout(() => controller.abort("timeout"), 270_000)
+    setElapsed(0)
+    setStatus("processing")
+    try {
+      await operation(controller.signal)
+    } catch (error) {
+      if (uploadController.current !== controller || controller.signal.reason === "cancel") return
+      if (controller.signal.reason === "pause") {
+        setStatus("paused")
+        setMessage("Tracking paused. Resume to check this batch.")
+      } else {
+        setStatus("error")
+        setMessage(controller.signal.reason === "timeout"
+          ? "Waiting timed out. Resume the batch to check its result."
+          : error instanceof Error && error.message !== "Failed to fetch"
+            ? error.message : "Could not connect to the billing service. Check that the backend is running.")
+      }
+    } finally {
+      window.clearTimeout(timeout)
+      if (uploadController.current === controller) uploadController.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    const restore = window.setTimeout(() => {
+      const id = savedJob()
+      if (id) {
+        setJobId(id)
+        setMessage("Checking your previous batch...")
+        void run(signal => trackJob(id, signal))
+      }
+    }, 0)
+    return () => {
+      window.clearTimeout(restore)
+      const controller = uploadController.current
+      uploadController.current = null
+      controller?.abort()
+    }
+  }, [run, trackJob])
+
+  const handleUpload = () => {
+    if (!files.length || uploadController.current) return
+    if (files.length > 50 || files.reduce((total, file) => total + file.size, 0) > 95 * 1024 * 1024) {
+      setStatus("error")
+      setMessage("Select at most 50 posters and keep each batch under 95 MB.")
+      return
+    }
+    setMessage("Uploading posters...")
+    setJobId(null)
+    void run(async signal => {
+      const formData = new FormData()
+      files.forEach(file => formData.append("files", file))
+      const response = await fetch(`${apiUrl}/jobs`, { method: "POST", body: formData, signal })
+      const result = await readResponse(response, "The billing service could not accept this upload.")
+      if (typeof result.id !== "string" || !/^[a-f0-9]{32}$/.test(result.id)) {
+        throw new Error("The billing service returned an invalid batch ID.")
+      }
+      savedJob(result.id)
+      setJobId(result.id)
+      await trackJob(result.id, signal)
+    })
   }
 
-  const handleUpload = async () => {
-    if (files.length === 0) return
+  const resume = () => {
+    if (!jobId) return
+    setMessage("Checking your batch...")
+    void run(signal => trackJob(jobId, signal))
+  }
 
-    setStatus('processing')
-    setMessage("Analyzing posters with AI...")
-
-    const formData = new FormData()
-    files.forEach((file) => {
-      formData.append("files", file)
-    })
-
+  const cancel = async () => {
+    setCancelPending(true)
     try {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL;
-      if (!apiUrl) throw new Error("NEXT_PUBLIC_API_URL is not set");
-
-      // Get session for token
-      const { data: { session } } = await supabase.auth.getSession()
-      const token = session?.access_token
-
-      const response = await fetch(`${apiUrl}/process-bills`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`
-        },
-        body: formData,
-      })
-
-      if (!response.ok) {
-        const errorText = await response.text()
-        throw new Error(`Server Error: ${response.status} ${errorText}`)
+      if (jobId) {
+        const response = await fetch(`${apiUrl}/jobs/${jobId}`, {
+          method: "DELETE", signal: AbortSignal.timeout(12_000),
+        })
+        if (!response.ok && response.status !== 404) {
+          throw new Error("Could not cancel this batch. Try again.")
+        }
       }
-
-      // Download the ZIP file
-      const blob = await response.blob()
-      const url = window.URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = `billing_files_${new Date().getTime()}.zip`
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      window.URL.revokeObjectURL(url)
-
-      setStatus('success')
-      setMessage("Files processed and downloaded!")
-      setFiles([]) // Reset
-    } catch (error: any) {
-      console.error(error)
-      setStatus('error')
-      setMessage(error.message || "An error occurred during processing.")
+      uploadController.current?.abort("cancel")
+      savedJob(null)
+      setJobId(null)
+      setStatus("idle")
+      setMessage("")
+    } catch {
+      setMessage("Could not cancel the batch. It may still be running.")
+    } finally {
+      setCancelPending(false)
     }
   }
-
-  if (loadingAuth) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-neutral-950 text-white">
-        <Loader2 className="h-8 w-8 animate-spin text-purple-500" />
-      </div>
-    )
-  }
-
-  if (!user) return null
 
   return (
     <div className="relative min-h-screen w-full overflow-hidden bg-neutral-950 text-white selection:bg-purple-500 selection:text-white">
       <BackgroundBeams />
 
-      <div className="absolute top-4 right-4 z-50">
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleSignOut}
-          className="bg-red-500/10 border-red-500/50 text-red-200 hover:bg-red-500/20 hover:text-red-100 transition-colors"
-        >
-          <LogOut className="mr-2 h-4 w-4" />
-          Sign Out
-        </Button>
-
-      </div>
-
-      <div className="relative z-10 flex min-h-screen flex-col items-center justify-center p-8">
+      <div className="relative z-10 flex min-h-screen flex-col items-center justify-center p-4 sm:p-8">
         <motion.div
           className="mb-12 text-center space-y-4"
         >
@@ -196,29 +203,10 @@ export default function Dashboard() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.8, ease: "easeOut" }}
           >
-            <h1 className="bg-gradient-to-b from-white to-white/60 bg-clip-text text-6xl font-bold tracking-tight text-transparent md:text-8xl">
+            <h1 className="bg-gradient-to-b from-white to-white/60 bg-clip-text text-4xl font-bold sm:text-6xl text-transparent md:text-7xl">
               ClubBill AI
             </h1>
           </motion.div>
-
-          {user && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: 0.3, duration: 0.8 }}
-              className="flex flex-col items-center gap-2"
-            >
-              <div className="flex items-center gap-2 bg-white/10 px-4 py-2 rounded-full border border-white/5">
-                {user.user_metadata?.avatar_url && (
-                  <img src={user.user_metadata.avatar_url} alt="Profile" className="w-6 h-6 rounded-full" />
-                )}
-                <span className="text-sm font-medium text-white">
-                  Welcome, {user.user_metadata?.full_name || user.email}
-                </span>
-              </div>
-              <span className="text-xs text-neutral-500">{user.email}</span>
-            </motion.div>
-          )}
 
           <motion.p
             initial={{ opacity: 0 }}
@@ -226,61 +214,89 @@ export default function Dashboard() {
             transition={{ delay: 0.4, duration: 0.8 }}
             className="text-lg text-neutral-400 md:text-xl max-w-2xl mx-auto"
           >
-            Experience the next dimension of automated billing.
-            Drag, drop, and let the AI handle the rest.
+            Poster billing
           </motion.p>
         </motion.div>
 
         <motion.div
-          initial={{ opacity: 0, scale: 0.9, rotateX: 20 }}
-          animate={{ opacity: 1, scale: 1, rotateX: 0 }}
-          transition={{ delay: 0.2, duration: 0.8, type: "spring" }}
-          className="w-full max-w-4xl [perspective:1000px]"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ duration: 0.2 }}
+          className="w-full max-w-3xl"
         >
-          <TiltCard className="group">
+          <section aria-label="Poster batch" className="rounded-lg border border-white/15 bg-neutral-900/90 p-4 sm:p-6">
             <div className="space-y-6">
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-2xl font-semibold text-white">Upload Posters</h2>
-                  <p className="text-sm text-neutral-400">Support for JPG, PNG, WEBP & ZIP</p>
+                  <p className="text-sm text-neutral-400">JPG, PNG & WEBP</p>
                 </div>
                 <Sparkles className="h-6 w-6 text-purple-400 animate-pulse" />
               </div>
 
               <div className="bg-neutral-900/50 rounded-lg p-1 border border-white/5">
                 <FileUpload
+                  files={files}
                   onFilesSelected={setFiles}
                   isProcessing={status === 'processing'}
                 />
               </div>
 
-              {status === 'error' && (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: "auto" }}
+              {status === 'processing' && (
+                <div role="status" aria-live="polite" className="flex items-center gap-2 text-sm text-neutral-300">
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                  <p>{message} {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")} elapsed</p>
+                </div>
+              )}
+
+              {(status === "error" || status === "paused") && (
+                <div
+                  role="alert"
                   className="p-4 rounded-md bg-red-500/10 border border-red-500/20 text-red-200 flex items-center gap-2"
                 >
-                  <AlertCircle className="w-5 h-5" />
-                  <p>{message}</p>
-                </motion.div>
+                  <AlertCircle className="h-5 w-5 shrink-0" />
+                  <p className="min-w-0 break-words">{message}</p>
+                </div>
               )}
 
               {status === 'success' && (
-                <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: "auto" }}
+                <div
+                  role="status"
                   className="p-4 rounded-md bg-green-500/10 border border-green-500/20 text-green-200 flex items-center gap-2"
                 >
-                  <CheckCircle className="w-5 h-5" />
-                  <p>{message}</p>
-                </motion.div>
+                  <CheckCircle className="h-5 w-5 shrink-0" />
+                  <p className="min-w-0 break-words">{message}</p>
+                </div>
               )}
 
-              <div className="flex justify-end pt-4">
+              {downloadUrl && (
+                <Button asChild size="lg" className="w-full bg-white text-black hover:bg-neutral-200">
+                  <a href={downloadUrl}>
+                    <Download className="mr-2 h-4 w-4" />
+                    {status === "success" ? "Download Excel ZIP" : "Download last Excel ZIP"}
+                  </a>
+                </Button>
+              )}
+
+              <div className="flex flex-wrap justify-end gap-3 pt-4">
+                {status === "processing" && jobId && (
+                  <Button variant="outline" onClick={() => uploadController.current?.abort("pause")} disabled={cancelPending}>
+                    Pause tracking
+                  </Button>
+                )}
+                {(status === "processing" || (jobId && (status === "paused" || status === "error"))) && (
+                  <Button variant="outline" onClick={cancel} disabled={cancelPending}>
+                    <X className="mr-2 h-4 w-4" />
+                    Cancel batch
+                  </Button>
+                )}
+                {jobId && (status === "paused" || status === "error") && (
+                  <Button variant="outline" onClick={resume} disabled={cancelPending}>Resume batch</Button>
+                )}
                 <Button
                   size="lg"
                   onClick={handleUpload}
-                  disabled={files.length === 0 || status === 'processing'}
+                  disabled={files.length === 0 || status === "processing" || cancelPending || (jobId !== null && status !== "success")}
                   className="w-full sm:w-auto bg-white text-black hover:bg-neutral-200 transition-all duration-300 shadow-[0_0_20px_rgba(255,255,255,0.3)] hover:shadow-[0_0_30px_rgba(255,255,255,0.5)]"
                 >
                   {status === 'processing' ? (
@@ -291,13 +307,13 @@ export default function Dashboard() {
                   ) : (
                     <>
                       <Download className="mr-2 h-4 w-4" />
-                      Process & Download
+                      Process posters
                     </>
                   )}
                 </Button>
               </div>
             </div>
-          </TiltCard>
+          </section>
         </motion.div>
       </div>
     </div>

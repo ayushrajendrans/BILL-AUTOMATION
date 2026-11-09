@@ -1,7 +1,7 @@
 "use client";
 
 import type React from "react"
-import { useState, useRef } from "react"
+import { useRef } from "react"
 import { motion, useMotionValue, useSpring, useTransform } from "framer-motion"
 import { cn } from "@/lib/utils"
 
