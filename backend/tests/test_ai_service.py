@@ -26,7 +26,6 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
         self.environment = patch.dict(os.environ, {
             "GEMINI_API_KEY": "test-key",
             "GOOGLE_API_KEY": "",
-            "OPENAI_API_KEY": "",
             "GEMINI_MODEL": "gemini-3.1-flash-lite",
         })
         self.environment.start()
@@ -91,7 +90,7 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["club_name"], "TEST")
 
     async def test_missing_configuration(self):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "OPENAI_API_KEY": "retired-provider-key"}):
             async with self.client_class(
                 transport=httpx.ASGITransport(app=app), base_url="http://test"
             ) as client:

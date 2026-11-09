@@ -24,10 +24,12 @@ class AnalysisError(Exception):
         self.status_code = status_code
 
 
+def gemini_key():
+    return os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+
+
 def has_ai_configuration():
-    return any(os.getenv(name, "").strip() for name in (
-        "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"
-    ))
+    return bool(gemini_key())
 
 
 def prepare_image(image_bytes):
@@ -77,54 +79,35 @@ async def request_analysis(url, headers, payload):
 
 
 async def analyze_image_with_gemini(image_bytes, mime_type="image/jpeg"):
-    api_key = (os.getenv("GEMINI_API_KEY", "").strip()
-               or os.getenv("GOOGLE_API_KEY", "").strip())
-    github_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key and not github_key:
+    api_key = gemini_key()
+    if not api_key:
         raise AnalysisError("Set GEMINI_API_KEY on the billing server.", 503)
 
     encoded_image = await asyncio.to_thread(prepare_image, image_bytes)
-    if api_key:
-        model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.1-flash-lite"
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        headers = {"x-goog-api-key": api_key}
-        payload = {
-            "contents": [{"parts": [
-                {"text": PROMPT},
-                {"inlineData": {"mimeType": "image/jpeg", "data": encoded_image}},
-            ]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseSchema": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "club_name": {"type": "STRING"},
-                        "event_date": {"type": "STRING"},
-                    },
-                    "required": ["club_name", "event_date"],
+    model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.1-flash-lite"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    payload = {
+        "contents": [{"parts": [
+            {"text": PROMPT},
+            {"inlineData": {"mimeType": "image/jpeg", "data": encoded_image}},
+        ]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "club_name": {"type": "STRING"},
+                    "event_date": {"type": "STRING"},
                 },
-                "maxOutputTokens": 300,
+                "required": ["club_name", "event_date"],
             },
-        }
-    else:
-        url = "https://models.inference.ai.azure.com/chat/completions"
-        headers = {"Authorization": f"Bearer {github_key}"}
-        payload = {
-            "model": "gpt-4o",
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": PROMPT},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}},
-            ]}],
-            "max_tokens": 300,
-        }
-    response = await request_analysis(url, headers, payload)
+            "maxOutputTokens": 300,
+        },
+    }
+    response = await request_analysis(url, {"x-goog-api-key": api_key}, payload)
     try:
-        data = response.json()
-        if api_key:
-            parts = data["candidates"][0]["content"]["parts"]
-            content = "".join(part.get("text", "") for part in parts if not part.get("thought"))
-        else:
-            content = data["choices"][0]["message"]["content"]
+        parts = response.json()["candidates"][0]["content"]["parts"]
+        content = "".join(part.get("text", "") for part in parts if not part.get("thought"))
         content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         result = json.loads(content)
         if not isinstance(result, dict) or any(

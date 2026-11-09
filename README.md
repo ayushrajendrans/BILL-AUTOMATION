@@ -36,8 +36,8 @@ on the free tier to avoid paid usage. See https://ai.google.dev/gemini-api/docs/
 The free tier may use submitted content to improve Google's products.
 Restart the backend after changing its environment file.
 
-Existing GitHub Models setups can still use `OPENAI_API_KEY`. When
-`GEMINI_API_KEY` is set, Gemini is used instead.
+GitHub Models has been retired. Replace legacy `OPENAI_API_KEY` configuration
+with a Gemini key in `GEMINI_API_KEY`.
 
 Select up to 50 JPG, PNG, or WEBP posters (95 MB total). Uploads create a
 background batch with progress and cancellation. Refreshing restores the last
