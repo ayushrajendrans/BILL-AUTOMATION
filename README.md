@@ -55,6 +55,10 @@ results and leaves only the unchecked posters queued. Short rate-limit waits
 can retry automatically; otherwise resume when quota is available or export
 the posters already processed. ZIP input is not supported.
 
+The backend spaces Gemini requests at least 5.25 seconds apart, including
+retries, to stay below the project's 15 requests-per-minute limit. Large runs
+take longer, and the project's daily quota still applies.
+
 ### 2. Frontend Setup
 ```bash
 cd frontend

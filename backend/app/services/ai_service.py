@@ -4,6 +4,7 @@ import io
 import json
 import math
 import os
+from time import monotonic
 
 import httpx
 from PIL import Image, ImageOps
@@ -26,6 +27,23 @@ class AnalysisError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.retry_after = retry_after
+
+
+class RequestPacer:
+    def __init__(self, spacing):
+        self.spacing = spacing
+        self.next_at = 0.0
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self.lock:
+            while (remaining := self.next_at - monotonic()) > 0:
+                await asyncio.sleep(remaining)
+            self.next_at = monotonic() + self.spacing
+
+
+# Leave headroom below the project's 15 requests per minute limit.
+request_pacer = RequestPacer(5.25)
 
 
 def gemini_key():
@@ -83,6 +101,7 @@ def prepare_image(image_bytes):
 async def request_analysis(url, headers, payload):
     async with httpx.AsyncClient(timeout=httpx.Timeout(25, connect=5)) as client:
         for attempt in range(2):
+            await request_pacer.wait()
             try:
                 response = await client.post(url, headers=headers, json=payload)
             except httpx.RequestError as error:

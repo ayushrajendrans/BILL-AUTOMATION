@@ -12,7 +12,7 @@ from openpyxl import load_workbook
 from PIL import Image
 
 from app.main import app, jobs, make_archive
-from app.services.ai_service import AnalysisError, analyze_image_with_gemini
+from app.services.ai_service import AnalysisError, RequestPacer, analyze_image_with_gemini
 
 
 def sample_poster(size=(20, 20)):
@@ -30,6 +30,10 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        pacer = patch("app.services.ai_service.request_pacer")
+        self.request_pacer = pacer.start()
+        self.request_pacer.wait = AsyncMock()
+        self.addCleanup(pacer.stop)
         self.client_class = httpx.AsyncClient
 
     def mock_provider(self, handler):
@@ -100,6 +104,7 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
         ) as delay:
             result = await analyze_image_with_gemini(sample_poster())
         delay.assert_awaited_once()
+        self.assertEqual(self.request_pacer.wait.await_count, 2)
         self.assertEqual(result["club_name"], "TEST")
 
     async def test_missing_configuration(self):
@@ -358,6 +363,33 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["retry_after"], 5)
         self.assertEqual(status["failed"], 0)
         self.assertEqual(analyze.await_count, 2)
+
+
+class RequestPacerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_requests_share_the_same_rate_budget(self):
+        pacer = RequestPacer(5.25)
+        now = 0.0
+        dispatched = []
+        yield_control = asyncio.sleep
+
+        async def advance(seconds):
+            nonlocal now
+            await yield_control(0)
+            now += seconds
+
+        async def request():
+            await pacer.wait()
+            dispatched.append(now)
+
+        with patch("app.services.ai_service.monotonic", lambda: now), patch(
+            "app.services.ai_service.asyncio.sleep", advance
+        ):
+            await asyncio.gather(*(request() for _ in range(30)))
+        self.assertEqual(len(dispatched), 30)
+        self.assertTrue(all(b - a >= 5.25 for a, b in zip(dispatched, dispatched[1:])))
+        self.assertTrue(all(
+            sum(start <= stamp < start + 60 for stamp in dispatched) <= 12 for start in dispatched
+        ))
 
 
 if __name__ == "__main__":
