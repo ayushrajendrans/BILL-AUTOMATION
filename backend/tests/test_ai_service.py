@@ -65,6 +65,19 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 429)
         self.assertIn("quota", str(raised.exception))
 
+    async def test_only_short_rate_limits_offer_automatic_retry(self):
+        info = {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "2.4s"}
+        daily = {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [
+            {"quotaId": "GenerateRequestsPerDayPerProject"}
+        ]}
+        for details, expected in (([info], 3), ([info, daily], None)):
+            with self.mock_provider(lambda request: httpx.Response(429, json={
+                "error": {"details": details}
+            })):
+                with self.assertRaises(AnalysisError) as raised:
+                    await analyze_image_with_gemini(sample_poster())
+            self.assertEqual(raised.exception.retry_after, expected)
+
     async def test_invalid_output(self):
         with self.mock_provider(lambda request: httpx.Response(200, json={
             "candidates": [{"content": {"parts": [{"text": '{"club_name":null}'}]}}]
@@ -320,6 +333,31 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
                 "rows": [{"club_name": "TEST", "date": "08-Oct", "thumbnail": "not base64"}]
             })
         self.assertEqual(response.status_code, 422)
+
+    async def test_partial_quota_failure_keeps_successful_rows_and_returns_pending_indices(self):
+        analyze = AsyncMock(side_effect=[
+            {"club_name": "North Club", "event_date": "08-Oct"},
+            AnalysisError("Temporary quota limit", 429, retry_after=5),
+        ])
+        async with self.client_class(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client, asyncio.timeout(5):
+            with patch("app.main.analyze_image_with_gemini", analyze):
+                response = await client.post("/jobs", data={"extract_only": "true"}, files=[
+                    ("files", (f"poster-{index}.png", sample_poster(), "image/png"))
+                    for index in range(3)
+                ])
+                self.assertEqual(response.status_code, 202)
+                job_id = response.json()["id"]
+                self.addCleanup(lambda: jobs.pop(job_id, None))
+                await jobs[job_id]["task"]
+            data = (await client.get(f"/jobs/{job_id}/results")).json()
+            status = (await client.get(f"/jobs/{job_id}")).json()
+        self.assertEqual(len(data["rows"]), 1)
+        self.assertEqual(data["retry_indices"], [1, 2])
+        self.assertEqual(data["retry_after"], 5)
+        self.assertEqual(status["failed"], 0)
+        self.assertEqual(analyze.await_count, 2)
 
 
 if __name__ == "__main__":

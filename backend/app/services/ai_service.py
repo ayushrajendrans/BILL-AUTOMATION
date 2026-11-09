@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import json
+import math
 import os
 
 import httpx
@@ -21,9 +22,10 @@ PROMPT = (
 
 
 class AnalysisError(Exception):
-    def __init__(self, message, status_code=502):
+    def __init__(self, message, status_code=502, retry_after=None):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after = retry_after
 
 
 def gemini_key():
@@ -32,6 +34,28 @@ def gemini_key():
 
 def has_ai_configuration():
     return bool(gemini_key())
+
+
+def quota_retry_after(response):
+    try:
+        error = response.json().get("error", {})
+        details = [detail for detail in error.get("details", []) if isinstance(detail, dict)]
+        if error.get("type") == "quota_exceeded" or any(
+            "perday" in str(violation.get("quotaId", "")).replace("_", "").casefold()
+            for detail in details
+            for violation in detail.get("violations", [])
+            if isinstance(violation, dict)
+        ):
+            return None
+        delays = [response.headers.get("Retry-After", "")]
+        delays.extend(
+            str(detail.get("retryDelay", "")).removesuffix("s")
+            for detail in details if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo"
+        )
+        seconds = max((float(delay) for delay in delays if delay), default=0)
+        return math.ceil(seconds) if 0 < seconds <= 90 else None
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def prepare_image(image_bytes):
@@ -68,7 +92,11 @@ async def request_analysis(url, headers, payload):
                 if response.status_code == 200:
                     return response
                 if response.status_code == 429:
-                    raise AnalysisError("The AI request limit or free quota was reached. Try after it resets.", 429)
+                    raise AnalysisError(
+                        "Gemini reached its request limit or quota. Try again after it resets.",
+                        429,
+                        retry_after=quota_retry_after(response),
+                    )
                 if response.status_code in (401, 403):
                     raise AnalysisError("The AI key was rejected. Check the key and model access on the server.", response.status_code)
                 if response.status_code == 404:

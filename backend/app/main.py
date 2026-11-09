@@ -59,6 +59,9 @@ class BatchResult:
     notes: list[str]
     failed: int
     review: int
+    retry_indices: list[int]
+    retry_message: str | None
+    retry_after: int | None
 
 
 class ExportRow(BaseModel):
@@ -145,6 +148,9 @@ async def start_job(files: list[UploadFile] = File(...), extract_only: bool = Fo
                         for row in result.rows
                     ],
                     "notes": result.notes,
+                    "retry_indices": result.retry_indices,
+                    "retry_message": result.retry_message,
+                    "retry_after": result.retry_after,
                 }
             else:
                 job["archive"] = await asyncio.to_thread(make_archive, result.rows, result.notes)
@@ -317,10 +323,14 @@ async def build_bills(posters, progress=None, thumbnail_only=False):
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    rows, notes, errors = [], [], []
+    rows, notes, errors, retry_indices, retry_errors = [], [], [], [], []
     review = 0
-    for poster, result in zip(posters, results):
+    for index, (poster, result) in enumerate(zip(posters, results)):
         if isinstance(result, AnalysisError):
+            if thumbnail_only and result.status_code in (401, 403, 429, 500, 502, 503, 504):
+                retry_indices.append(index)
+                retry_errors.append(result)
+                continue
             errors.append(result)
             notes.append(f"Skipped {poster.filename}: {result}")
             continue
@@ -334,12 +344,17 @@ async def build_bills(posters, progress=None, thumbnail_only=False):
             notes.append(f"Review {poster.filename}: the poster image could not be embedded.")
         rows.append(result)
 
-    if not rows:
+    if not rows and not thumbnail_only:
         first = errors[0]
         raise HTTPException(first.status_code, f"No posters processed. {first}")
     if progress:
         progress("Preparing results", len(posters))
-    return BatchResult(rows=rows, notes=notes, failed=len(errors), review=review)
+    retry_after = None
+    if retry_errors and all(error.status_code == 429 and error.retry_after for error in retry_errors):
+        retry_after = max(error.retry_after for error in retry_errors)
+    return BatchResult(rows=rows, notes=notes, failed=len(errors), review=review,
+                       retry_indices=retry_indices, retry_message=str(retry_errors[0]) if retry_errors else None,
+                       retry_after=retry_after)
 
 
 @app.get("/")

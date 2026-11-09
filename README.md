@@ -50,8 +50,10 @@ download button. It does not delete files you have already downloaded.
 If some posters fail, successful ones still appear in the ZIP.
 `processing-report.txt` lists skipped posters and any details to review.
 The app keeps completed parts in the current page while processing. If a later
-part fails, you can resume or export the posters already processed. ZIP input is
-not supported.
+part hits a temporary service error or Gemini quota, it keeps completed
+results and leaves only the unchecked posters queued. Short rate-limit waits
+can retry automatically; otherwise resume when quota is available or export
+the posters already processed. ZIP input is not supported.
 
 ### 2. Frontend Setup
 ```bash

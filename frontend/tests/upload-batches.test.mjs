@@ -3,9 +3,9 @@ import { test } from "node:test"
 import { MAX_UPLOAD_BYTES, splitUploads } from "../lib/upload-batches.ts"
 
 test("splits a large selection without losing or reordering files", () => {
-  const files = Array.from({ length: 103 }, (_, index) => ({ index, size: 1 }))
+  const files = Array.from({ length: 320 }, (_, index) => ({ index, size: 1 }))
   const parts = splitUploads(files)
-  assert.deepEqual(parts.map(part => part.length), [50, 50, 3])
+  assert.deepEqual(parts.map(part => part.length), Array(16).fill(20))
   assert.deepEqual(parts.flat(), files)
 })
 

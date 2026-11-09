@@ -1,5 +1,5 @@
-export const MAX_UPLOAD_BYTES = 95 * 1024 * 1024
-const MAX_UPLOAD_FILES = 50
+export const MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+const MAX_UPLOAD_FILES = 20
 
 export function splitUploads<T extends { size: number }>(files: readonly T[]): T[][] {
   const batches: T[][] = []

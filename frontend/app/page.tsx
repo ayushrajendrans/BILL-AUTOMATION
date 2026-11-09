@@ -14,9 +14,27 @@ type Status = "idle" | "processing" | "success" | "error" | "paused"
 type PosterRow = { club_name: string, date: string, month: string, thumbnail: string }
 type PartSummary = { total: number, skipped: number, review: number }
 type PartResult = PartSummary & { rows: PosterRow[], notes: string[] }
-type UploadQueue = { batches: File[][], next: number, results: PartResult[], retried: Set<number> }
+type UploadQueue = {
+  batches: File[][], next: number, total: number, checked: number, results: PartResult[],
+  retried: Set<number>, cooledDown: Set<number>,
+}
 
 class MissingJob extends Error {}
+
+function waitForRetry(milliseconds: number, signal: AbortSignal) {
+  signal.throwIfAborted()
+  return new Promise<void>((resolve, reject) => {
+    const abort = () => {
+      window.clearTimeout(timer)
+      reject(signal.reason)
+    }
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener("abort", abort)
+      resolve()
+    }, milliseconds)
+    signal.addEventListener("abort", abort, { once: true })
+  })
+}
 
 async function readResponse(response: Response, fallback: string) {
   const body = await response.json().catch(() => null)
@@ -31,6 +49,7 @@ export default function Dashboard() {
   const [status, setStatus] = useState<Status>("idle")
   const [message, setMessage] = useState("")
   const [elapsed, setElapsed] = useState(0)
+  const [progress, setProgress] = useState<{ checked: number, total: number } | null>(null)
   const [jobId, setJobId] = useState<string | null>(null)
   const [downloadUrl, setDownloadUrl] = useState("")
   const [canResume, setCanResume] = useState(false)
@@ -130,16 +149,41 @@ export default function Dashboard() {
         })
         if (response.status === 404) throw new MissingJob("The server no longer has this part.")
         const data = await readResponse(response, "Could not retrieve the extracted poster details. Resume to try again.")
-        if (!Array.isArray(data.rows) || !data.rows.length || !Array.isArray(data.notes)) {
+        if (!Array.isArray(data.rows) || !Array.isArray(data.notes)) {
           throw new Error("The billing service returned invalid poster details.")
         }
+        const retryIndices: unknown[] = Array.isArray(data.retry_indices) ? data.retry_indices : []
+        const retry = new Set(retryIndices.filter((index): index is number =>
+          typeof index === "number" && Number.isInteger(index) && index >= 0 && index < batch.length))
+        if (data.rows.length + part.skipped + retry.size !== batch.length) {
+          throw new Error("The billing service returned an incomplete part. Resume to check it again.")
+        }
         signal.throwIfAborted()
-        pending.results.push({ ...part, rows: data.rows, notes: data.notes })
-        pending.next++
-        setCanExportPartial(true)
+        if (data.rows.length || data.notes.length) {
+          pending.results.push({ ...part, rows: data.rows, notes: data.notes })
+        }
+        pending.checked += batch.length - retry.size
+        setProgress({ checked: pending.checked, total: pending.total })
+        setCanExportPartial(pending.results.some(result => result.rows.length > 0))
         setActiveJob(null)
-        const processed = new Set(batch)
+        const processed = new Set(batch.filter((_, index) => !retry.has(index)))
         setFiles(current => current.filter(file => !processed.has(file)))
+        if (retry.size) {
+          pending.batches[pending.next] = batch.filter((_, index) => retry.has(index))
+          const delay = Number(data.retry_after)
+          if (Number.isFinite(delay) && delay >= 1 && delay <= 90 && !pending.cooledDown.has(pending.next)) {
+            pending.cooledDown.add(pending.next)
+            setMessage(`Gemini is throttling requests. Retrying the remaining posters in ${Math.ceil(delay)} seconds.`)
+            await waitForRetry(Math.ceil(delay * 1000), signal)
+            continue
+          }
+          setStatus("paused")
+          setMessage(typeof data.retry_message === "string"
+            ? `${data.retry_message} Resume when ready; completed posters are kept.`
+            : "Processing paused. Resume to retry the remaining posters.")
+          return
+        }
+        pending.next++
       } catch (error) {
         if (!(error instanceof MissingJob)) throw error
         setActiveJob(null)
@@ -156,7 +200,13 @@ export default function Dashboard() {
     const notes = pending.results.flatMap(part => part.notes)
     const skipped = pending.results.reduce((sum, part) => sum + part.skipped, 0)
     const review = pending.results.reduce((sum, part) => sum + part.review, 0)
-    if (!rows.length) throw new Error("No posters were processed. Try again.")
+    if (!rows.length) {
+      queue.current = null
+      setCanResume(false)
+      setCanExportPartial(false)
+      setProgress(null)
+      throw new Error("No readable posters were found. Try again with clearer images.")
+    }
     setMessage("Grouping posters by club and creating the Excel ZIP...")
     const response = await fetch(`${apiUrl}/exports`, {
       method: "POST",
@@ -228,7 +278,11 @@ export default function Dashboard() {
   const handleUpload = () => {
     if (!files.length || uploadController.current || queue.current) return
     replaceDownload("")
-    queue.current = { batches: splitUploads(files), next: 0, results: [], retried: new Set() }
+    queue.current = {
+      batches: splitUploads(files), next: 0, total: files.length, checked: 0, results: [],
+      retried: new Set(), cooledDown: new Set(),
+    }
+    setProgress({ checked: 0, total: files.length })
     setCanResume(true)
     void run()
   }
@@ -237,6 +291,7 @@ export default function Dashboard() {
     const pending = queue.current
     if (!pending) return
     pending.retried.delete(pending.next)
+    pending.cooledDown.delete(pending.next)
     setMessage("Resuming processing...")
     void run()
   }
@@ -260,6 +315,7 @@ export default function Dashboard() {
         queue.current = null
         setCanResume(false)
         setCanExportPartial(false)
+        setProgress(null)
         setStatus("idle")
         setMessage("")
       }
@@ -322,6 +378,14 @@ export default function Dashboard() {
                   isProcessing={canResume}
                 />
               </div>
+
+              {canResume && progress && (
+                <div className="space-y-1 text-sm text-neutral-300">
+                  <p>{progress.checked} of {progress.total} posters checked</p>
+                  <progress aria-label="Posters checked" value={progress.checked} max={progress.total}
+                    className="h-2 w-full accent-emerald-400" />
+                </div>
+              )}
 
               {status === 'processing' && (
                 <div role="status" aria-live="polite" className="flex items-center gap-2 text-sm text-neutral-300">
