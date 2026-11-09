@@ -39,9 +39,11 @@ Restart the backend after changing its environment file.
 GitHub Models has been retired. Replace legacy `OPENAI_API_KEY` configuration
 with a Gemini key in `GEMINI_API_KEY`.
 
-Select up to 50 JPG, PNG, or WEBP posters (95 MB total). Uploads create a
-background batch with progress and cancellation. Refreshing restores the last
-batch in that browser tab. When processing finishes, click Download Excel ZIP.
+Select your JPG, PNG, or WEBP posters together. Large selections are split into
+uploads automatically, and each completed part has a ZIP download. An image
+larger than one upload is resized in the browser. Refreshing restores the active
+part and completed download links in that tab; any files not yet sent need to be
+selected again.
 
 If some posters fail, successful ones still appear in the ZIP.
 `processing-report.txt` lists skipped posters and any details to review.
