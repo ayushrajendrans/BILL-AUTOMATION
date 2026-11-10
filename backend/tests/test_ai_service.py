@@ -12,7 +12,7 @@ from openpyxl import load_workbook
 from PIL import Image
 
 from app.main import Poster, app, build_bills, jobs, make_archive
-from app.services.ai_service import AnalysisError, RequestPacer, analyze_image_with_gemini
+from app.services.ai_service import AnalysisError, RequestPacer, analyze_image, analyze_image_with_gemini
 
 
 def sample_poster(size=(20, 20)):
@@ -27,6 +27,8 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
             "GEMINI_API_KEY": "test-key",
             "GOOGLE_API_KEY": "",
             "GEMINI_MODEL": "gemini-3.1-flash-lite",
+            "CLOUDFLARE_ACCOUNT_ID": "",
+            "CLOUDFLARE_API_TOKEN": "",
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -68,6 +70,60 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
                 await analyze_image_with_gemini(sample_poster())
         self.assertEqual(raised.exception.status_code, 429)
         self.assertIn("quota", str(raised.exception))
+
+    async def test_gemini_quota_routes_pending_posters_to_cloudflare_until_cooldown(self):
+        hosts = []
+        now = 1000
+        expected = {"club_name": "TEST", "event_date": "08-Oct", "event_month": "October"}
+
+        def handler(request):
+            hosts.append(request.url.host)
+            if request.url.host == "generativelanguage.googleapis.com":
+                if now == 1000:
+                    return httpx.Response(429)
+                return httpx.Response(200, json={"candidates": [{
+                    "content": {"parts": [{"text": json.dumps(expected)}]}
+                }]})
+            self.assertTrue(request.url.path.endswith("/account-id/ai/run/@cf/google/gemma-4-26b-a4b-it"))
+            self.assertEqual(request.headers["Authorization"], "Bearer test-token")
+            self.assertNotIn("x-goog-api-key", request.headers)
+            payload = json.loads(request.content)
+            uri = payload["messages"][0]["content"][1]["image_url"]["url"]
+            self.assertTrue(uri.startswith("data:image/jpeg;base64,"))
+            with Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1]))) as image:
+                self.assertEqual(image.format, "JPEG")
+            return httpx.Response(200, json={"success": True, "result": {"response": json.dumps(expected)}})
+
+        with self.mock_provider(handler), patch.dict(os.environ, {
+            "CLOUDFLARE_ACCOUNT_ID": "account-id",
+            "CLOUDFLARE_API_TOKEN": "test-token",
+        }), patch("app.services.ai_service.monotonic", lambda: now), patch(
+            "app.services.ai_service.gemini_unavailable_until", 0.0
+        ):
+            self.assertEqual(await analyze_image(sample_poster()), expected)
+            self.assertEqual(await analyze_image(sample_poster()), expected)
+            now = 1301
+            self.assertEqual(await analyze_image(sample_poster()), expected)
+        self.assertEqual(hosts, [
+            "generativelanguage.googleapis.com", "api.cloudflare.com", "api.cloudflare.com",
+            "generativelanguage.googleapis.com",
+        ])
+
+    async def test_cloudflare_only_distinguishes_daily_limit_from_capacity(self):
+        def handler(request):
+            self.assertEqual(request.url.host, "api.cloudflare.com")
+            return httpx.Response(429, json={"success": False, "errors": [{"code": code}]})
+
+        with self.mock_provider(handler), patch.dict(os.environ, {
+            "GEMINI_API_KEY": "",
+            "CLOUDFLARE_ACCOUNT_ID": "account-id",
+            "CLOUDFLARE_API_TOKEN": "test-token",
+        }):
+            for code, retry_after in ((3036, None), (3040, 25)):
+                with self.subTest(code=code), self.assertRaises(AnalysisError) as raised:
+                    await analyze_image(sample_poster())
+                self.assertEqual(raised.exception.status_code, 429)
+                self.assertEqual(raised.exception.retry_after, retry_after)
 
     async def test_only_short_rate_limits_offer_automatic_retry(self):
         info = {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "2.4s"}
@@ -126,7 +182,7 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
             (AnalysisError("Daily quota exhausted", 429), None, "Daily quota exhausted"),
         ):
             with self.subTest(expected_wait=expected_wait), patch(
-                "app.main.analyze_image_with_gemini", side_effect=[
+                "app.main.analyze_image", side_effect=[
                     {"club_name": "TEST", "event_date": "08-Oct"},
                     AnalysisError("Gemini unavailable", 503, retry_after=25),
                     second_error,
@@ -178,7 +234,7 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
                 cancelled.set()
 
         with patch("app.main.BATCH_TIMEOUT", 0.01), patch(
-            "app.main.analyze_image_with_gemini", stalled
+            "app.main.analyze_image", stalled
         ):
             async with self.client_class(
                 transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -200,7 +256,7 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
             active -= 1
             return {"club_name": "TEST", "event_date": "08-Oct"}
 
-        with patch("app.main.analyze_image_with_gemini", analyze), patch(
+        with patch("app.main.analyze_image", analyze), patch(
             "app.main.create_excel_with_images", return_value=b"workbook"
         ):
             async with self.client_class(
@@ -221,7 +277,7 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
         async with self.client_class(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
-            with patch("app.main.analyze_image_with_gemini", analyze), patch(
+            with patch("app.main.analyze_image", analyze), patch(
                 "app.main.create_excel_with_images", return_value=b"workbook"
             ):
                 response = await client.post(
@@ -296,7 +352,7 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
         async with self.client_class(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client, asyncio.timeout(5):
-            with patch("app.main.analyze_image_with_gemini", stalled):
+            with patch("app.main.analyze_image", stalled):
                 response = await client.post("/jobs", files={"files": ("poster.png", sample_poster(), "image/png")})
                 job_id = response.json()["id"]
                 self.addCleanup(lambda: jobs.pop(job_id, None))
@@ -327,7 +383,7 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client, asyncio.timeout(5):
             parts = []
-            with patch("app.main.analyze_image_with_gemini", analyze):
+            with patch("app.main.analyze_image", analyze):
                 for count in (2, 1):
                     response = await client.post("/jobs", data={"extract_only": "true"}, files=[
                         ("files", (f"poster-{index}.png", sample_poster(), "image/png"))
@@ -378,7 +434,7 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
         async with self.client_class(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client, asyncio.timeout(5):
-            with patch("app.main.analyze_image_with_gemini", analyze):
+            with patch("app.main.analyze_image", analyze):
                 response = await client.post("/jobs", data={"extract_only": "true"}, files=[
                     ("files", (f"poster-{index}.png", sample_poster(), "image/png"))
                     for index in range(3)

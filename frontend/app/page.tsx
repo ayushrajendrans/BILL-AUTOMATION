@@ -193,7 +193,7 @@ export default function Dashboard() {
           const delay = Number(data.retry_after)
           if (Number.isFinite(delay) && delay >= 1 && delay <= 90 && !pending.cooledDown.has(pending.next)) {
             pending.cooledDown.add(pending.next)
-            setMessage(`Waiting for Gemini. Retrying the remaining posters in ${Math.ceil(delay)} seconds.`)
+            setMessage(`Waiting for the analysis service. Retrying the remaining posters in ${Math.ceil(delay)} seconds.`)
             await waitForRetry(Math.ceil(delay * 1000), signal)
             continue
           }

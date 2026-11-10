@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, Response
 from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 
-from app.services.ai_service import AnalysisError, analyze_image_with_gemini, has_ai_configuration
+from app.services.ai_service import AnalysisError, analyze_image, has_ai_configuration
 from app.services.excel_service import (
     THUMBNAIL_SIZE,
     create_excel_with_images,
@@ -78,7 +78,7 @@ class BillingExport(BaseModel):
 
 def require_provider():
     if not has_ai_configuration():
-        raise HTTPException(503, "Poster analysis is not configured. Set GEMINI_API_KEY on the server.")
+        raise HTTPException(503, "Poster analysis is not configured. Set GEMINI_API_KEY or configure Cloudflare Workers AI.")
 
 
 async def read_posters(files):
@@ -287,7 +287,7 @@ async def build_bills(posters, progress=None, thumbnail_only=False):
             try:
                 if provider_failure is not None:
                     return provider_failure
-                result = await analyze_image_with_gemini(poster.content, poster.mime_type)
+                result = await analyze_image(poster.content, poster.mime_type)
                 if not result:
                     raise AnalysisError("No poster details could be extracted.", 422)
                 row = {

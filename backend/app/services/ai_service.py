@@ -12,6 +12,9 @@ from PIL import Image, ImageOps
 
 logger = logging.getLogger("uvicorn.error")
 SERVICE_COOLDOWN = 25
+GEMINI_FALLBACK_COOLDOWN = 60
+CLOUDFLARE_MODEL = "@cf/google/gemma-4-26b-a4b-it"
+gemini_unavailable_until = 0.0
 
 PROMPT = (
     "Extract club_name, event_date, and event_month from this nightclub poster. "
@@ -54,8 +57,14 @@ def gemini_key():
     return os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
 
 
+def cloudflare_credentials():
+    account = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+    return (account, token) if account and token else None
+
+
 def has_ai_configuration():
-    return bool(gemini_key())
+    return bool(gemini_key() or cloudflare_credentials())
 
 
 def quota_retry_after(response):
@@ -168,15 +177,88 @@ async def analyze_image_with_gemini(image_bytes, mime_type="image/jpeg"):
     try:
         parts = response.json()["candidates"][0]["content"]["parts"]
         content = "".join(part.get("text", "") for part in parts if not part.get("thought"))
-        content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        result = json.loads(content)
-        if not isinstance(result, dict) or any(
-            not isinstance(result.get(field), str) or not result[field].strip()
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as error:
+        raise AnalysisError("The AI could not read this poster. Try a clearer image.", 422) from error
+    return parse_poster_result(content)
+
+
+def parse_poster_result(content):
+    try:
+        if isinstance(content, str):
+            content = content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            content = json.loads(content)
+        if not isinstance(content, dict) or any(
+            not isinstance(content.get(field), str) or not content[field].strip()
             for field in ("club_name", "event_date")
         ):
             raise ValueError("Invalid poster fields")
-        if "event_month" in result and not isinstance(result["event_month"], str):
-            result["event_month"] = ""
-        return result
-    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as error:
+        if "event_month" in content and not isinstance(content["event_month"], str):
+            content["event_month"] = ""
+        return content
+    except ValueError as error:
         raise AnalysisError("The AI could not read this poster. Try a clearer image.", 422) from error
+
+
+async def analyze_image_with_cloudflare(image_bytes, account, token):
+    image = await asyncio.to_thread(prepare_image, image_bytes)
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{CLOUDFLARE_MODEL}"
+    payload = {
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image}"}},
+        ]}],
+        "chat_template_kwargs": {"enable_thinking": False},
+        "response_format": {"type": "json_object"},
+        "max_tokens": 300,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(25, connect=5)) as client:
+            response = await client.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload)
+    except httpx.RequestError as error:
+        raise AnalysisError("Cannot reach Cloudflare Workers AI. Try again shortly.", 503, SERVICE_COOLDOWN) from error
+
+    body = {}
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            body = data
+    except ValueError:
+        pass
+    status = response.status_code
+    if status == 429:
+        errors = body.get("errors")
+        codes = [item.get("code") for item in errors if isinstance(item, dict)] if isinstance(errors, list) else []
+        if 3036 in codes:
+            raise AnalysisError("Cloudflare Workers AI reached its daily free limit. Resume after the quota resets.", 429)
+        raise AnalysisError("Cloudflare Workers AI is busy. Try again shortly.", 429, SERVICE_COOLDOWN)
+    if status in (408, 500, 502, 503, 504):
+        raise AnalysisError("Cloudflare Workers AI is temporarily unavailable.", 503, SERVICE_COOLDOWN)
+    if not response.is_success:
+        logger.warning("Cloudflare Workers AI rejected the request (HTTP %s)", status)
+        raise AnalysisError("Cloudflare Workers AI rejected the request. Check the fallback configuration.", 403)
+    result = body.get("result")
+    if body.get("success") is not True or not isinstance(result, dict):
+        raise AnalysisError("Cloudflare Workers AI returned an incomplete response.", 503, SERVICE_COOLDOWN)
+    try:
+        content = result["response"] if "response" in result else result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise AnalysisError("Cloudflare Workers AI returned an incomplete response.", 503, SERVICE_COOLDOWN) from error
+    return parse_poster_result(content)
+
+
+async def analyze_image(image_bytes, mime_type="image/jpeg"):
+    global gemini_unavailable_until
+    cloudflare = cloudflare_credentials()
+    if not cloudflare:
+        return await analyze_image_with_gemini(image_bytes, mime_type)
+    if gemini_key() and monotonic() >= gemini_unavailable_until:
+        try:
+            return await analyze_image_with_gemini(image_bytes, mime_type)
+        except AnalysisError as error:
+            if error.status_code not in (429, 500, 502, 503, 504):
+                raise
+            cooldown = 300 if error.status_code == 429 and error.retry_after is None else GEMINI_FALLBACK_COOLDOWN
+            retry_at = monotonic() + max(cooldown, error.retry_after or 0)
+            gemini_unavailable_until = max(gemini_unavailable_until, retry_at)
+            logger.info("Switching poster analysis to Cloudflare Workers AI (Gemini HTTP %s)", error.status_code)
+    return await analyze_image_with_cloudflare(image_bytes, *cloudflare)

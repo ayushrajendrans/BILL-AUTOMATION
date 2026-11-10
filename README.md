@@ -60,6 +60,21 @@ The backend spaces Gemini requests at least 5.25 seconds apart, including
 retries, to stay below the project's 15 requests-per-minute limit. Large runs
 take longer, and the project's daily quota still applies.
 
+To enable the optional Cloudflare Workers AI fallback, create a Workers AI
+API token on a Cloudflare Workers Free account and add these server environment
+variables in Render (or in `backend/.env` for local testing):
+
+```env
+CLOUDFLARE_ACCOUNT_ID=<Cloudflare account ID>
+CLOUDFLARE_API_TOKEN=<Workers AI API token>
+```
+
+Gemini handles analysis first. If Gemini hits a rate limit or is unavailable
+after retries, the app uses Gemma 4 on Cloudflare for pending posters during a
+short cooldown. If you configure only Cloudflare, it handles all analysis.
+Cloudflare's free allocation is 10,000 Neurons per day. See
+https://developers.cloudflare.com/workers-ai/get-started/rest-api/ for setup.
+
 ### 2. Frontend Setup
 ```bash
 cd frontend
