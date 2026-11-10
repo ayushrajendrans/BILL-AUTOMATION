@@ -117,7 +117,7 @@ export default function Dashboard() {
     if (!pending) return
     while (!exportPartial && pending.next < pending.batches.length) {
       signal.throwIfAborted()
-      const batch = pending.batches[pending.next]
+      let batch = pending.batches[pending.next]
       const prefix = pending.batches.length > 1
         ? `Part ${pending.next + 1} of ${pending.batches.length}: ` : ""
       let id = activeJob.current
@@ -125,16 +125,36 @@ export default function Dashboard() {
         setMessage(prefix + "Uploading posters...")
         const formData = new FormData()
         formData.append("extract_only", "true")
+        const skipped = new Set<File>()
+        const notes: string[] = []
         for (const file of batch) {
-          const upload = await fitUpload(file)
+          try {
+            formData.append("files", await fitUpload(file))
+          } catch {
+            skipped.add(file)
+            notes.push(`Skipped ${file.name}: The browser could not prepare this image for upload.`)
+          }
           signal.throwIfAborted()
-          formData.append("files", upload)
+        }
+        if (skipped.size) {
+          pending.results.push({ total: skipped.size, skipped: skipped.size, review: 0, rows: [], notes })
+          pending.checked += skipped.size
+          setProgress({ checked: pending.checked, total: pending.total })
+          setFiles(current => current.filter(file => !skipped.has(file)))
+          batch = batch.filter(file => !skipped.has(file))
+          pending.batches[pending.next] = batch
+          if (!batch.length) {
+            pending.next++
+            continue
+          }
         }
         const response = await fetch(`${apiUrl}/jobs`, {
           method: "POST", body: formData,
           signal: AbortSignal.any([signal, AbortSignal.timeout(125_000)]),
         })
-        const result = await readResponse(response, "The billing service could not accept this upload.")
+        const result = await readResponse(response, response.ok
+          ? prefix + "The server returned an unreadable upload response. Resume to try again."
+          : prefix + `The upload failed (HTTP ${response.status}). Resume to try again.`)
         const createdId: unknown = result.id
         if (!isJobId(createdId)) throw new Error("The billing service returned an invalid batch ID.")
         id = createdId

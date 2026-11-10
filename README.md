@@ -42,7 +42,7 @@ with a Gemini key in `GEMINI_API_KEY`.
 Select your JPG, PNG, or WEBP posters together. Large selections are split into
 uploads automatically. The app combines results from all parts into one ZIP,
 with a workbook for each club. Each workbook lists the date, club, month, and
-poster. An image larger than one upload is resized in the browser. If the
+poster. Large images are compressed in the browser before upload. If the
 server loses an active part, the app retries it once while the page is open.
 Keep the page open during processing; refreshing clears the selection and the
 download button. It does not delete files you have already downloaded.

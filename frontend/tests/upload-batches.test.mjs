@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { MAX_UPLOAD_BYTES, splitUploads } from "../lib/upload-batches.ts"
+import { fitUpload, MAX_POSTER_BYTES, MAX_UPLOAD_BYTES, splitUploads } from "../lib/upload-batches.ts"
 
 test("splits a large selection without losing or reordering files", () => {
   const files = Array.from({ length: 320 }, (_, index) => ({ index, size: 1 }))
@@ -10,12 +10,23 @@ test("splits a large selection without losing or reordering files", () => {
 })
 
 test("keeps each upload within the byte budget", () => {
-  const files = [{ size: MAX_UPLOAD_BYTES - 1 }, { size: 1 }, { size: 1 }]
+  const files = Array.from({ length: 5 }, () => ({ size: MAX_POSTER_BYTES }))
   const parts = splitUploads(files)
-  assert.deepEqual(parts, [[files[0], files[1]], [files[2]]])
+  assert.equal(files.slice(0, 4).reduce((size, file) => size + file.size, 0), MAX_UPLOAD_BYTES)
+  assert.deepEqual(parts, [files.slice(0, 4), files.slice(4)])
 })
 
-test("isolates an oversized poster for resizing before upload", () => {
-  const files = [{ size: 1 }, { size: MAX_UPLOAD_BYTES + 1 }, { size: 1 }]
-  assert.deepEqual(splitUploads(files), files.map(file => [file]))
+test("plans a 310-poster selection using the compressed size of large posters", () => {
+  const files = Array.from({ length: 310 }, (_, index) => ({ index, size: 13 * MAX_POSTER_BYTES }))
+  const parts = splitUploads(files)
+  assert.equal(parts.length, 78)
+  assert.deepEqual(parts.flat(), files)
+})
+
+test("uses the image extension when the browser omits its MIME type", async () => {
+  const original = new File(["test"], "03:09 poster.PNG")
+  const upload = await fitUpload(original)
+  assert.equal(upload.name, original.name)
+  assert.equal(upload.type, "image/png")
+  assert.equal(await upload.text(), "test")
 })
