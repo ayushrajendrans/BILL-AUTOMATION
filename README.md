@@ -51,9 +51,10 @@ If some posters fail, successful ones still appear in the ZIP.
 `processing-report.txt` lists skipped posters and any details to review.
 The app keeps completed parts in the current page while processing. If a later
 part hits a temporary service error or Gemini quota, it keeps completed
-results and leaves only the unchecked posters queued. Short rate-limit waits
-can retry automatically; otherwise resume when quota is available or export
-the posters already processed. ZIP input is not supported.
+results and leaves only the unchecked posters queued. Temporary Gemini outages
+and short rate-limit waits can retry automatically. If processing pauses, resume
+when Gemini is available or export the posters already processed. ZIP input is
+not supported.
 
 The backend spaces Gemini requests at least 5.25 seconds apart, including
 retries, to stay below the project's 15 requests-per-minute limit. Large runs

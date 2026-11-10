@@ -11,7 +11,7 @@ import httpx
 from openpyxl import load_workbook
 from PIL import Image
 
-from app.main import app, jobs, make_archive
+from app.main import Poster, app, build_bills, jobs, make_archive
 from app.services.ai_service import AnalysisError, RequestPacer, analyze_image_with_gemini
 
 
@@ -95,17 +95,48 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
                 await analyze_image_with_gemini(b"not an image")
         self.assertEqual(raised.exception.status_code, 400)
 
-    async def test_transient_provider_error_retries_once(self):
-        responses = iter([httpx.Response(503), httpx.Response(200, json={"candidates": [{
+    async def test_transient_provider_errors_recover_with_backoff(self):
+        responses = iter([httpx.Response(503), httpx.Response(504), httpx.Response(200, json={"candidates": [{
             "content": {"parts": [{"text": '{"club_name":"TEST","event_date":"08-Oct"}'}]}
         }]})])
         with self.mock_provider(lambda request: next(responses)), patch(
             "app.services.ai_service.asyncio.sleep", new_callable=AsyncMock
         ) as delay:
             result = await analyze_image_with_gemini(sample_poster())
-        delay.assert_awaited_once()
-        self.assertEqual(self.request_pacer.wait.await_count, 2)
+        self.assertEqual([call.args for call in delay.await_args_list], [(6,), (16,)])
+        self.assertEqual(self.request_pacer.wait.await_count, 3)
         self.assertEqual(result["club_name"], "TEST")
+
+    async def test_persistent_outage_gives_the_batch_a_bounded_cooldown(self):
+        with self.mock_provider(lambda request: httpx.Response(503)), patch(
+            "app.services.ai_service.asyncio.sleep", new_callable=AsyncMock
+        ), self.assertLogs("uvicorn.error", level="WARNING"):
+            with self.assertRaises(AnalysisError) as raised:
+                await analyze_image_with_gemini(sample_poster())
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.retry_after, 25)
+        self.assertIn("HTTP 503", str(raised.exception))
+        self.assertEqual(self.request_pacer.wait.await_count, 3)
+
+    async def test_outage_retries_only_pending_posters_unless_daily_quota_blocks(self):
+        image = sample_poster()
+        posters = [Poster(f"poster-{i}.png", "image/png", image) for i in range(3)]
+        for second_error, expected_wait, expected_message in (
+            (AnalysisError("Short rate limit", 429, retry_after=5), 25, "Gemini unavailable"),
+            (AnalysisError("Daily quota exhausted", 429), None, "Daily quota exhausted"),
+        ):
+            with self.subTest(expected_wait=expected_wait), patch(
+                "app.main.analyze_image_with_gemini", side_effect=[
+                    {"club_name": "TEST", "event_date": "08-Oct"},
+                    AnalysisError("Gemini unavailable", 503, retry_after=25),
+                    second_error,
+                ],
+            ):
+                result = await build_bills(posters, thumbnail_only=True)
+                self.assertEqual(len(result.rows), 1)
+                self.assertEqual(result.retry_indices, [1, 2])
+                self.assertEqual(result.retry_after, expected_wait)
+                self.assertEqual(result.retry_message, expected_message)
 
     async def test_missing_configuration(self):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "OPENAI_API_KEY": "retired-provider-key"}):

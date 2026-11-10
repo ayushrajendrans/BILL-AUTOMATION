@@ -349,16 +349,18 @@ async def build_bills(posters, progress=None, thumbnail_only=False):
         raise HTTPException(first.status_code, f"No posters processed. {first}")
     if progress:
         progress("Preparing results", len(posters))
-    retry_after = None
-    if retry_errors and all(error.status_code == 429 and error.retry_after for error in retry_errors):
-        retry_after = max(error.retry_after for error in retry_errors)
+    blocking_error = next((error for error in retry_errors if error.retry_after is None), None)
+    retry_after = None if blocking_error else max((error.retry_after for error in retry_errors), default=None)
+    retry_message = str(blocking_error or retry_errors[0]) if retry_errors else None
     return BatchResult(rows=rows, notes=notes, failed=len(errors), review=review,
-                       retry_indices=retry_indices, retry_message=str(retry_errors[0]) if retry_errors else None,
+                       retry_indices=retry_indices, retry_message=retry_message,
                        retry_after=retry_after)
 
 
 @app.get("/")
-def read_root():
+def read_root(response: Response):
+    if revision := os.getenv("RENDER_GIT_COMMIT"):
+        response.headers["X-ClubBill-Revision"] = revision
     return {"message": "ClubBill AI API is running."}
 
 

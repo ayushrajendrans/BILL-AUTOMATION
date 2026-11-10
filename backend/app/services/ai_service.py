@@ -2,12 +2,16 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import math
 import os
 from time import monotonic
 
 import httpx
 from PIL import Image, ImageOps
+
+logger = logging.getLogger("uvicorn.error")
+SERVICE_COOLDOWN = 25
 
 PROMPT = (
     "Extract club_name, event_date, and event_month from this nightclub poster. "
@@ -100,13 +104,13 @@ def prepare_image(image_bytes):
 
 async def request_analysis(url, headers, payload):
     async with httpx.AsyncClient(timeout=httpx.Timeout(25, connect=5)) as client:
-        for attempt in range(2):
+        for backoff in (6, 16, None):
             await request_pacer.wait()
             try:
                 response = await client.post(url, headers=headers, json=payload)
             except httpx.RequestError as error:
-                if attempt:
-                    raise AnalysisError("Cannot reach the AI service. Try again shortly.", 503) from error
+                reason = type(error).__name__
+                message = "Cannot reach Gemini. Try again shortly."
             else:
                 if response.status_code == 200:
                     return response
@@ -122,9 +126,15 @@ async def request_analysis(url, headers, payload):
                     raise AnalysisError("The configured AI model is unavailable. Check the server model setting.", 403)
                 if response.status_code == 400:
                     raise AnalysisError("The AI service rejected this poster. Try re-exporting the image.", 422)
-                if response.status_code not in (500, 502, 503, 504) or attempt:
-                    raise AnalysisError("The AI service is unavailable. Try again shortly.", 503)
-            await asyncio.sleep(1)
+                reason = f"HTTP {response.status_code}"
+                if response.status_code not in (500, 502, 503, 504):
+                    logger.warning("Gemini rejected the request (%s)", reason)
+                    raise AnalysisError(f"Gemini rejected the request ({reason}).", 502)
+                message = f"Gemini is temporarily unavailable ({reason}). Try again shortly."
+            if backoff is None:
+                logger.warning("Gemini request failed after retries (%s)", reason)
+                raise AnalysisError(message, 503, retry_after=SERVICE_COOLDOWN)
+            await asyncio.sleep(backoff)
 
 
 async def analyze_image_with_gemini(image_bytes, mime_type="image/jpeg"):
