@@ -312,6 +312,30 @@ class GeminiTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 400)
 
+    async def test_retrying_an_accepted_upload_reuses_its_analysis(self):
+        job_id = "1234567890abcdef" * 2
+        self.addCleanup(lambda: jobs.pop(job_id, None))
+        analyze = AsyncMock(return_value={"club_name": "TEST", "event_date": "08-Oct"})
+        async with self.client_class(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client, asyncio.timeout(5):
+            with patch("app.main.analyze_image", analyze):
+                async def upload():
+                    return await client.post(
+                        "/jobs", data={"job_id": job_id, "extract_only": "true"},
+                        files={"files": ("poster.png", sample_poster(), "image/png")},
+                    )
+
+                first, retry = await asyncio.gather(upload(), upload())
+                for response in (first, retry):
+                    self.assertEqual(response.status_code, 202)
+                    self.assertEqual(response.json()["id"], job_id)
+                await jobs[job_id]["task"]
+                self.assertEqual((await upload()).json()["id"], job_id)
+            results = (await client.get(f"/jobs/{job_id}/results")).json()
+        self.assertEqual(len(results["rows"]), 1)
+        analyze.assert_awaited_once()
+
     async def test_batch_with_corrupt_poster_still_downloads_valid_workbook(self):
         def handler(request):
             return httpx.Response(200, json={"candidates": [{

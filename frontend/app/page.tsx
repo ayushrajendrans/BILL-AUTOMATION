@@ -10,6 +10,7 @@ import { fitUpload, splitUploads } from "@/lib/upload-batches"
 
 const apiUrl = "/api"
 const isJobId = (id: unknown): id is string => typeof id === "string" && /^[a-f0-9]{32}$/.test(id)
+const retryableUploadStatuses = new Set([408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524])
 type Status = "idle" | "processing" | "success" | "error" | "paused"
 type PosterRow = { club_name: string, date: string, month: string, thumbnail: string }
 type PartSummary = { total: number, skipped: number, review: number }
@@ -17,6 +18,7 @@ type PartResult = PartSummary & { rows: PosterRow[], notes: string[] }
 type UploadQueue = {
   batches: File[][], next: number, total: number, checked: number, results: PartResult[],
   retried: Set<number>, cooledDown: Set<number>,
+  uploadId?: string,
 }
 
 class MissingJob extends Error {}
@@ -42,6 +44,26 @@ async function readResponse(response: Response, fallback: string) {
     throw new Error(typeof body?.detail === "string" ? body.detail : fallback)
   }
   return body
+}
+
+async function uploadPart(formData: FormData, signal: AbortSignal, onRetry: () => void) {
+  const retryDelays = [2000, 6000]
+  for (let attempt = 0; ; attempt++) {
+    signal.throwIfAborted()
+    const lastAttempt = attempt === retryDelays.length
+    let response: Response | undefined
+    try {
+      response = await fetch(`${apiUrl}/jobs`, {
+        method: "POST", body: formData,
+        signal: AbortSignal.any([signal, AbortSignal.timeout(125_000)]),
+      })
+    } catch (error) {
+      if (signal.aborted || lastAttempt) throw error
+    }
+    if (response && (lastAttempt || !retryableUploadStatuses.has(response.status))) return response
+    onRetry()
+    await waitForRetry(retryDelays[attempt], signal)
+  }
 }
 
 export default function Dashboard() {
@@ -148,9 +170,10 @@ export default function Dashboard() {
             continue
           }
         }
-        const response = await fetch(`${apiUrl}/jobs`, {
-          method: "POST", body: formData,
-          signal: AbortSignal.any([signal, AbortSignal.timeout(125_000)]),
+        pending.uploadId ??= crypto.randomUUID().replaceAll("-", "")
+        formData.append("job_id", pending.uploadId)
+        const response = await uploadPart(formData, signal, () => {
+          setMessage(prefix + "Upload interrupted. Retrying this part...")
         })
         const result = await readResponse(response, response.ok
           ? prefix + "The server returned an unreadable upload response. Resume to try again."
@@ -159,6 +182,7 @@ export default function Dashboard() {
         if (!isJobId(createdId)) throw new Error("The billing service returned an invalid batch ID.")
         id = createdId
         setActiveJob(id)
+        pending.uploadId = undefined
       }
 
       try {

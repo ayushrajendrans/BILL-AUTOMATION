@@ -112,10 +112,19 @@ def get_job(job_id):
 
 
 @app.post("/jobs", status_code=202)
-async def start_job(files: list[UploadFile] = File(...), extract_only: bool = Form(False)):
+async def start_job(
+    files: list[UploadFile] = File(...),
+    extract_only: bool = Form(False),
+    job_id: str | None = Form(None, pattern=r"^[a-f0-9]{32}$"),
+):
+    remove_expired_jobs()
+    if job_id in jobs:
+        return {"id": job_id, "status": "processing"}
     require_provider()
     posters = await read_posters(files)
-    remove_expired_jobs()
+    # A concurrent retry can register this upload while its files are being read.
+    if job_id in jobs:
+        return {"id": job_id, "status": "processing"}
     if sum(job["status"] == "processing" for job in jobs.values()) >= 2:
         raise HTTPException(429, "Two batches are already processing. Wait for one to finish.")
     if len(jobs) >= 20:
@@ -125,7 +134,7 @@ async def start_job(files: list[UploadFile] = File(...), extract_only: bool = Fo
         )
         del jobs[oldest]
 
-    job_id = uuid.uuid4().hex
+    job_id = job_id or uuid.uuid4().hex
     job = {"status": "processing", "completed": 0, "total": len(posters),
            "stage": "Analyzing posters", "failed": 0, "review": 0}
     jobs[job_id] = job
